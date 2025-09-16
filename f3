@@ -1,0 +1,477 @@
+Terraform + Spark-on-EKS + Glue/Athena setup, with versions where they appeared explicitly in your logs or manifests:
+
+🖥️ Infrastructure Provisioning
+
+Terraform: v1.x (your run pulled modules compatible with TF ≥ 0.13)
+
+Terraform AWS Provider: ~> 5.x (logs showed module terraform-aws-modules/vpc/aws 5.21.0, eks/aws 20.37.2)
+
+Terraform Helm Provider: for installing Spark Operator via Helm
+
+Terraform Kubernetes Provider: for creating namespaces, service accounts
+
+☸️ Kubernetes / EKS
+
+Amazon EKS: Kubernetes v1.29.15 (from kubectl get nodes output)
+
+Amazon Linux 2 (AMI): Kernel 5.10.240-238.959.amzn2.x86_64
+
+Container runtime: containerd v1.7.27
+
+📦 Spark Operator & Dependencies
+
+Spark Operator (Kubeflow): chart spark-operator-1.1.27, API version sparkoperator.k8s.io/v1beta2
+
+Helm: you ran Helm to add repo and install chart; version not printed, but assumed Helm v3.x (Terraform provider default)
+
+🔥 Apache Spark Runtime
+
+Apache Spark: version 3.5.x (you tried both Scala + Python jobs)
+
+Python SparkPi used → ghcr.io/apache/spark-py:v3.5.1
+
+Scala example used → bitnami/spark:3.5.1
+
+Example jars: spark-examples_2.12-3.5.1.jar
+
+Scala version: 2.12 (packaged with Spark 3.5.x builds)
+
+📊 Data & Query Services
+
+AWS Glue Catalog: used as Iceberg catalog (versionless, fully managed AWS service)
+
+AWS Athena: workgroup wg_iceberg (versionless, serverless, queries via Presto engine behind Athena)
+
+🗄️ Storage / Buckets
+
+Amazon S3:
+
+Lake bucket (primary)
+
+Lake bucket (DR)
+
+Athena results bucket
+(with Cross-Region Replication, versioning, SSE encryption)
+
+🔑 IAM / Authentication
+
+IAM OIDC provider: enabled for the EKS cluster
+
+IAM Role for ServiceAccount (IRSA): bound to spark-sa in spark-jobs namespace
+
+AWS Caller Identity data source: Terraform aws_caller_identity.current
+
+📜 Libraries / Connectors inside Spark
+
+Hadoop AWS connector: org.apache.hadoop.fs.s3a.S3AFileSystem (bundled with Spark 3.5 distros that include Hadoop 3.x)
+
+Iceberg runtime: org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.0
+
+Iceberg Glue integration:
+
+org.apache.iceberg.aws.glue.GlueCatalog
+
+org.apache.iceberg.aws.s3.S3FileIO
+
+org.apache.iceberg.aws.glue.DynamoLockManager
+
+🛠️ Supporting Tools
+
+AWS CLI v2: used for aws eks update-kubeconfig, aws s3 cp, aws athena start-query-execution
+
+kubectl: v1.29.x (compatible with your EKS cluster version)
+
+sed / bash scripting: used for patching YAML manifests and Terraform outputs
+
+✅ Summary in short list form
+
+Terraform ~1.x
+
+terraform-aws-modules/eks/aws 20.37.2
+
+terraform-aws-modules/vpc/aws 5.21.0
+
+Kubernetes v1.29.15 (EKS)
+
+Amazon Linux 2 AMI (Kernel 5.10.240-238.959)
+
+containerd v1.7.27
+
+Helm v3.x
+
+Spark Operator v1.1.27 (API v1beta2)
+
+Apache Spark 3.5.1 (Scala 2.12)
+
+Bitnami Spark image 3.5.1
+
+ghcr.io/apache/spark-py 3.5.1
+
+Iceberg runtime 1.5.0 (spark-runtime for Spark 3.5, Scala 2.12)
+
+AWS Glue Catalog (managed service)
+
+AWS Athena (managed service)
+
+AWS S3 with CRR + SSE
+
+
+
+                         ┌────────────────────────────────────────┐
+                         │             Provisioning               │
+                         │    Terraform + AWS/Helm/K8s providers  │
+                         │  - VPC, subnets, EKS, nodegroups       │
+                         │  - S3 {lake, lake-DR, athena-results}  │
+                         │  - Glue DB + Athena workgroup          │
+                         │  - IRSA roles & policies               │
+                         └────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                          Amazon EKS (Kubernetes 1.29)                         │
+│                                                                               │
+│  Namespaces:                                                                  │
+│   - spark-operator      - spark-jobs                                          │
+│                                                                               │
+│  spark-operator (Helm chart 1.1.27, API v1beta2)                              │
+│     ╰─ watches SparkApplication CRDs                                          │
+│                                                                               │
+│  ServiceAccount with IRSA (spark-sa)                                          │
+│     ╰─ IAM role grants:                                                       │
+│         - S3 RW to lake + write to athena-results                             │
+│         - Glue: GetDatabase/Table, Create/Alter, etc.                         │
+│         - (Optional) S3 CRR role policies                                     │
+│                                                                               │
+│  Node group(s):                                                               │
+│   - Managed node groups (AL2 + containerd) run Spark driver & executors       │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                          Data & Metastore Services                            │
+│                                                                               │
+│  S3                                                                        ┌───┴───┐
+│   - lake bucket (primary, versioned, SSE)  <─── CRR ───>  lake-DR bucket   │  DR   │
+│   - athena-results bucket                                                   └───────┘
+│                                                                               │
+│  AWS Glue Data Catalog (Iceberg catalog)                                      │
+│   - DB: iceberg_db                                                            │
+│                                                                               │
+│  Amazon Athena                                                                │
+│   - Workgroup: wg_iceberg                                                     │
+│   - Queries read Iceberg tables via Glue catalog                              │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+
+End-to-end workflow (sample job)
+
+Provision
+
+Terraform creates: VPC/EKS/nodegroups, S3 buckets (primary/DR + athena-results), Glue DB, Athena workgroup, OIDC + IRSA role, namespaces, and installs spark-operator (Helm 1.1.27).
+
+Submit Spark job
+
+You kubectl apply -n spark-jobs -f spark-iceberg.yaml (kind: SparkApplication).
+
+SparkOperator reconciles the CRD → creates driver pod, which then spawns executors.
+
+Credentials (IRSA)
+
+Driver & executors run as spark-sa → assume the IAM role via OIDC.
+
+They gain scoped access to S3 and Glue without node IAM creds or secrets.
+
+Read/Write data
+
+Spark uses Iceberg runtime 1.5.0 on Spark 3.5.x with:
+
+spark.sql.catalog.glue=org.apache.iceberg.aws.glue.GlueCatalog
+
+spark.sql.catalog.glue.warehouse=s3://<lake-bucket>/warehouse
+
+spark.sql.catalog.glue.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+
+Tables & metadata live in Glue/S3; data files land in lake bucket (CRR replicates to DR).
+
+Query with Athena
+
+Athena (workgroup wg_iceberg) reads the same Iceberg tables via Glue.
+
+Results are written to athena-results S3 bucket.
+
+Observability
+
+Watch job: kubectl get sparkapplications -n spark-jobs
+
+View driver/executor logs: kubectl logs -n spark-jobs <driver-pod>
+
+Component placement (quick map)
+
+Terraform → everything in the diagram (infra + k8s resources + Helm).
+
+Spark-operator (control plane in EKS) → manages SparkApplication lifecycle.
+
+Spark driver/executors (data plane in EKS) → run your code; talk to S3 & Glue via IRSA.
+
+S3 (primary/DR) → data lake (Iceberg tables) & CRR to DR.
+
+Glue → table/metadata catalog for Iceberg.
+
+Athena → SQL on the same Iceberg tables; results to S3.
+
+Minimal configs you’ll keep seeing
+
+SparkApplication (Python/Scala) essentials
+
+spec:
+  mode: cluster
+  sparkVersion: "3.5.0"
+  image: public.ecr.aws/datamechanics/spark:3.5-latest  # or bitnami/spark:3.5.1
+  mainApplicationFile: s3a://<LAKE_BUCKET>/scripts/create_iceberg.py
+  sparkConf:
+    spark.hadoop.fs.s3a.aws.credentials.provider: com.amazonaws.auth.WebIdentityTokenCredentialsProvider
+    spark.sql.catalog.glue: org.apache.iceberg.aws.glue.GlueCatalog
+    spark.sql.catalog.glue.warehouse: s3a://<LAKE_BUCKET>/warehouse
+    spark.sql.catalog.glue.io-impl: org.apache.iceberg.aws.s3.S3FileIO
+    spark.sql.catalog.glue.lock-impl: org.apache.iceberg.aws.glue.DynamoLockManager
+  driver:
+    serviceAccount: spark-sa
+    cores: 1
+    memory: 2g
+  executor:
+    instances: 2
+    cores: 1
+    memory: 2g
+
+
+Athena (same data, SQL)
+
+Database: iceberg_db (Terraform creates)
+
+Workgroup: wg_iceberg
+
+Run: SELECT * FROM "iceberg_db"."<table>" LIMIT 10;
+
+=======
+
+
+1) What Terraform created (by service)
+Amazon EKS (compute)
+
+EKS cluster: spark-eks-iceberg-eks (primary region: us-east-1).
+
+Managed node group: worker nodes that run Spark driver/executor pods.
+
+OIDC provider for the cluster (IRSA), so pods can assume AWS IAM roles without node-wide keys.
+
+Kubernetes objects (created by TF + Helm)
+
+Namespace: spark-operator – runs the Spark Operator (Helm chart).
+
+Namespace: spark-jobs – where you submit SparkApplication CRs.
+
+ServiceAccount: spark-sa (in spark-jobs) annotated for IRSA so Spark pods can access S3/Glue.
+
+Helm release: spark-operator (chart repo https://kubeflow.github.io/spark-operator, app v1.1.x).
+
+Storage (data lake & DR)
+
+Primary S3 lake bucket: e.g. satish-lake-east1-<acct>
+
+DR S3 lake bucket: e.g. satish-lake-west2-<acct>
+
+Bi-directional S3 CRR (replication) between the two lake buckets (primary → DR and DR → primary).
+
+S3 results bucket for Athena: satish-athena-results-<acct> with bucket policy & default SSE.
+
+Versioning, SSE, and public access blocks on all buckets.
+
+Catalog / Query
+
+AWS Glue Data Catalog database: iceberg_db (Iceberg catalog points its warehouse to S3).
+
+Athena workgroup: wg_iceberg (results routed to the Athena results bucket).
+
+IAM (high level)
+
+IRSA role/policy for Spark (spark-sa) – grants least-privilege read/write to the lake bucket(s), Glue, and (if needed) Athena APIs.
+
+S3 replication role/policy – allows buckets to replicate each other.
+
+(You also saw supporting bits like VPC, subnets, security groups, and the Terraform state/lock files; those are the plumping you rarely have to touch day-to-day.)
+
+                +-------------------------------+
+                |         Amazon Athena         |
+                |    (queries via Glue Catalog) |
+                +---------------+---------------+
+                                |
+                                v
++--------------+        +-------+--------+        +---------------------+
+|  Spark jobs  |  IRSA  |   Glue Catalog | <----> |   S3 Lake (Primary) |
+| (SparkOperator)|----->|  (db: iceberg_db)      |  s3://.../warehouse |
+| Driver/Exec  |        +-------+--------+        +---------+-----------+
+|   Pods on    |                ^                           |
+|     EKS      |                |                           | CRR (bi-dir)
++------+-------+                |                           v
+       |                        |                  +---------------------+
+       |                        +------------------+   S3 Lake (DR)      |
+       |                                           +---------------------+
+       |
+       +--> CloudWatch / kubectl logs (operational visibility)
+
+
+
+Key ideas
+
+Spark jobs run on EKS; pods assume IAM permissions via IRSA.
+
+Iceberg tables are stored in S3 (warehouse path) and registered in Glue.
+
+Athena reads Iceberg tables through the Glue Catalog, writing results to the Athena results bucket.
+
+Cross-Region Replication keeps the lake in sync for DR.
+
+3) End-to-end workflow for sample jobs
+
+Below is a stable, minimal workflow you can repeat. It uses images that always pull and the v1beta2 SparkApplication CRD (what you installed).
+
+A) Sanity Spark job (SparkPi)
+
+Submit a tiny job to prove the operator, cluster, and IAM are wired:
+
+# Clean up any older jobs
+kubectl -n spark-jobs delete sparkapplication spark-pi --ignore-not-found
+
+# Submit SparkPi (Python)
+cat <<'YAML' | kubectl apply -n spark-jobs -f -
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: spark-pi
+  namespace: spark-jobs
+spec:
+  type: Python
+  pythonVersion: "3"
+  mode: cluster
+  image: ghcr.io/apache/spark-py:v3.5.1
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: local:///opt/spark/examples/src/main/python/pi.py
+  sparkVersion: "3.5.1"
+  restartPolicy: { type: Never }
+  driver:
+    serviceAccount: spark-sa
+    cores: 1
+    memory: 1g
+  executor:
+    cores: 1
+    instances: 1
+    memory: 1g
+YAML
+
+# Watch state until COMPLETED/FAILED
+watch -n 5 "kubectl -n spark-jobs get sparkapplications spark-pi -o jsonpath='{.status.applicationState.state}{\"\\n\"}'"
+
+
+If you see ImagePullBackOff: your nodes can’t reach GHCR/Docker Hub. Either allow egress or use a registry mirror accessible from your VPC.
+
+B) Iceberg sample (writes to S3, registers in Glue)
+
+Start with a simple Spark job that sets the Iceberg catalog settings and writes a tiny table.
+
+# Use your actual outputs
+LAKE_BUCKET=$(terraform output -raw lake_bucket_name)
+PRIMARY_REGION=$(terraform output -raw primary_region)
+
+cat <<YAML > /tmp/spark-iceberg.yaml
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: spark-iceberg-job
+  namespace: spark-jobs
+spec:
+  type: Scala
+  mode: cluster
+  image: docker.io/bitnami/spark:3.5.1
+  imagePullPolicy: IfNotPresent
+  mainClass: org.apache.spark.sql.SparkSession
+  mainApplicationFile: local:///opt/bitnami/spark/examples/jars/spark-examples_2.12-3.5.1.jar
+  arguments: []   # (We’ll do the work via --conf and --class only for demo; switch to your real app later)
+  sparkVersion: "3.5.1"
+  restartPolicy: { type: Never }
+  driver:
+    serviceAccount: spark-sa
+    cores: 1
+    memory: 2g
+  executor:
+    cores: 1
+    instances: 2
+    memory: 2g
+  sparkConf:
+    spark.hadoop.fs.s3a.aws.credentials.provider: com.amazonaws.auth.WebIdentityTokenCredentialsProvider
+    spark.sql.catalog.glue: org.apache.iceberg.aws.glue.GlueCatalog
+    spark.sql.catalog.glue.warehouse: s3a://${LAKE_BUCKET}/warehouse
+    spark.sql.catalog.glue.io-impl: org.apache.iceberg.aws.s3.S3FileIO
+    spark.sql.catalog.glue.lock-impl: org.apache.iceberg.aws.glue.DynamoLockManager
+    spark.sql.catalog.glue.region: ${PRIMARY_REGION}
+YAML
+
+kubectl apply -n spark-jobs -f /tmp/spark-iceberg.yaml
+watch -n 5 "kubectl -n spark-jobs get sparkapplications spark-iceberg-job -o jsonpath='{.status.applicationState.state}{\"\\n\"}'"
+
+
+Swap in your real mainApplicationFile (e.g., a Python file in the container, or a JAR you package) that executes Iceberg DDL/DML (create namespace/table, insert small data). The critical part is the spark.sql.catalog.glue.* config and the S3A/IRSA credentials provider.
+
+C) Query with Athena
+
+Once your job writes an Iceberg table into the Glue catalog, query it:
+
+WG=$(terraform output -raw athena_workgroup_name)
+DB=iceberg_db
+# Simple example: discover tables
+aws athena start-query-execution \
+  --work-group "$WG" \
+  --query-string "SHOW TABLES IN ${DB};"
+
+
+(Use the Athena console for interactive exploration; results land in your Athena results bucket.)
+
+4) How to validate & operate
+
+Readiness
+
+kubectl -n spark-operator get pods → Spark Operator must be Running.
+
+kubectl -n spark-jobs get sa spark-sa -o yaml → confirm IRSA annotation is present.
+
+Job lifecycle
+
+kubectl -n spark-jobs get sparkapplications
+
+kubectl -n spark-jobs describe sparkapplication <name>
+
+kubectl -n spark-jobs logs <driver-pod> -f (on failure, check Events; image pulls are the #1 culprit)
+
+Data plane
+
+Confirm S3 writes under s3://<lake-bucket>/warehouse/...
+
+Check DR bucket to see replicated objects.
+
+Cost & security
+
+EKS nodes + S3 + Glue + Athena incur cost. Shut down when idle.
+
+Least-privilege IAM for IRSA (only S3 paths/Glue actions you need).
+
+Keep S3 versioning + block public access on.
+
+5) Typical issues & quick fixes
+
+ImagePullBackOff: Use a public image that exists (ghcr.io/apache/spark-py:v3.5.1 or bitnami/spark:3.5.1). Ensure your nodes have egress to that registry.
+
+CRD version mismatch: You installed the Operator that uses v1beta2. Make sure your SparkApplication manifests are apiVersion: sparkoperator.k8s.io/v1beta2.
+
+Access denied to S3/Glue: Verify spark-sa is annotated for IRSA and the IAM policy includes glue:* (scoped), s3:Get/Put/List to your buckets, and (if needed) athena:* for programmatic queries.
+
+Athena can’t find tables: Make sure your Spark job wrote using the same Glue catalog/database and S3 warehouse path you query from Athena.
