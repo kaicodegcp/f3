@@ -74,3 +74,20 @@ parameters:
   - name: PROJECT_DISPLAYNAME
   - name: PROJECT_DESCRIPTION
   - name: PROJECT_REQUESTING_USER
+
+
+Generate Red Hat’s bootstrap template to start from:
+
+oc adm create-bootstrap-project-template -o yaml > template.yaml
+
+
+Edit template.yaml and add your defaults under .objects[]. A minimal, production-friendly example is below.
+
+Create the template in the openshift-config namespace:
+
+oc create -f template.yaml -n openshift-config
+
+
+Tell the cluster to use it:
+
+oc edit project.config.openshift.io/cluster
