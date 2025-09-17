@@ -1,0 +1,66 @@
+Finish SparkPi validation (clean slate → success)
+1) Nuke any stragglers from earlier runs
+# delete any spark apps/pods/cms from both names used so far
+for APP in spark-pi spark-pi-v2; do
+  kubectl -n spark-jobs delete sparkapplication $APP --ignore-not-found
+done
+kubectl -n spark-jobs delete pod -l spark-app-selector in (spark-pi,spark-pi-v2) --ignore-not-found
+kubectl -n spark-jobs delete cm  -l spark-app-selector in (spark-pi,spark-pi-v2) --ignore-not-found
+
+# verify nothing left
+kubectl -n spark-jobs get pods,cm | grep -E 'spark-pi|No resources' || true
+
+2) Submit a freshly named SparkApplication
+cat > spark-pi-ok.yaml <<'YAML'
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: spark-pi-ok
+  namespace: spark-jobs
+spec:
+  type: Scala
+  mode: cluster
+  sparkVersion: "3.5.0"
+  image: bitnami/spark:3.5
+  imagePullPolicy: IfNotPresent
+  mainClass: org.apache.spark.examples.SparkPi
+  mainApplicationFile: "local:///opt/bitnami/spark/examples/jars/spark-examples_2.12-3.5.0.jar"
+  restartPolicy: { type: Never }
+  driver:
+    serviceAccount: spark
+    cores: 1
+    memory: 512m
+  executor:
+    cores: 1
+    memory: 512m
+    instances: 1
+YAML
+
+kubectl apply -f spark-pi-ok.yaml
+
+3) Watch and read the driver container logs
+kubectl -n spark-jobs get sparkapplications
+kubectl -n spark-jobs get pods -w
+# when the driver appears:
+DRV=$(kubectl -n spark-jobs get pod -l spark-role=driver,spark-app-selector=spark-pi-ok -o name)
+kubectl -n spark-jobs logs -f "$DRV" -c spark-kubernetes-driver
+# if it restarts fast, also try:
+kubectl -n spark-jobs logs "$DRV" -c spark-kubernetes-driver --previous
+
+
+Success criteria:
+
+SparkApplication state becomes COMPLETED
+
+kubectl -n spark-jobs get sparkapplications spark-pi-ok -o jsonpath='{.status.applicationState.state}'; echo
+
+
+Logs contain: Pi is roughly 3.14...
+
+If it errors again, please paste:
+
+kubectl -n spark-jobs describe pod "$DRV" | tail -n +1
+kubectl -n spark-jobs get events --sort-by=.lastTimestamp | tail -n 30
+
+
+(I’ll map the exact event to the fix.)
