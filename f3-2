@@ -1,0 +1,76 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: project-request
+  namespace: openshift-config
+objects:
+  # 1) Project (created by the API with parameters)
+  - apiVersion: project.openshift.io/v1
+    kind: Project
+    metadata:
+      name: "${PROJECT_NAME}"
+      annotations:
+        openshift.io/description: "${PROJECT_DESCRIPTION}"
+        openshift.io/display-name: "${PROJECT_DISPLAYNAME}"
+        owner: "${PROJECT_REQUESTING_USER}"
+      labels:
+        environment: "dev"                  # <- your standard labels
+        managed-by: "platform-team"
+  # 2) LimitRange: default requests/limits per container
+  - apiVersion: v1
+    kind: LimitRange
+    metadata:
+      name: defaults
+      namespace: "${PROJECT_NAME}"
+    spec:
+      limits:
+        - type: Container
+          default:
+            cpu: "500m"
+            memory: "1Gi"
+          defaultRequest:
+            cpu: "100m"
+            memory: "256Mi"
+  # 3) ResourceQuota: namespace-level caps
+  - apiVersion: v1
+    kind: ResourceQuota
+    metadata:
+      name: namespace-quota
+      namespace: "${PROJECT_NAME}"
+    spec:
+      hard:
+        pods: "150"
+        requests.cpu: "20"
+        requests.memory: "40Gi"
+        limits.cpu: "40"
+        limits.memory: "80Gi"
+        persistentvolumeclaims: "50"
+        services: "50"
+  # 4) NetworkPolicy: default deny all, then allow same-namespace traffic
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: default-deny-all
+      namespace: "${PROJECT_NAME}"
+    spec:
+      podSelector: {}
+      policyTypes: ["Ingress","Egress"]
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: allow-same-namespace
+      namespace: "${PROJECT_NAME}"
+    spec:
+      podSelector: {}
+      ingress:
+        - from:
+            - podSelector: {}
+      egress:
+        - to:
+            - podSelector: {}
+      policyTypes: ["Ingress","Egress"]
+parameters:
+  - name: PROJECT_NAME
+  - name: PROJECT_DISPLAYNAME
+  - name: PROJECT_DESCRIPTION
+  - name: PROJECT_REQUESTING_USER
