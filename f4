@@ -1,0 +1,85 @@
+Accelerating EAP Host Reusability through Safe Data Volume Cleanup:
+The EAP Strategic Solutions team completed development of a DataNode cleanup automation that safely wipes data volume groups (datavg) for both HDFS and Ozone host types. The Ansible-based solution enables administrators to perform a dry-run validation prior to destructive wipe operations, ensuring data integrity and full transparency before executing the final cleanup.
+
+This automation addresses the operational gap in securely repurposing existing hosts or preparing them for new assignments without Unix SA dependency.
+
+Key Achievements:
+
+Developed a dynamic Ansible playbook capable of identifying and wiping datavg on any HDFS or Ozone host.
+
+Implemented dual-mode execution:
+
+Dry-run mode generates a report of volumes that would be wiped.
+
+WIPE mode performs the actual cleanup after validation.
+
+Integrated user-driven execution from the Starfleet portal with email reports for each run.
+
+Tested successfully across both legacy and new EAP-managed server types.
+
+Benefits to the Team:
+
+Empowers faster host recycling without relying on external Unix SA teams.
+
+Ensures data safety by requiring dry-run review before actual cleanup.
+
+Reduces errors by enforcing automation and eliminating manual steps.
+
+Supports clean handoff for hardware refresh, lab rebuilds, and cluster expansion.
+
+Next Steps:
+
+Extend automation to include automatic /data/1–10 mount recreation post-cleanup.
+
+Add host-type awareness for validation logic and targeted cleanup.
+
+Promote the playbook to UAT and PROD environments post DEV validation.
+
+Let me know if you’d like a combined report for multiple automation projects this week or keep them tracked separately for clarity.
+
+You said:
+Another accomplishment created script to rebuild the datavg into 10 mounts for ozone datanodes host type use case that helped to complete the ozone hardward with /data/1 to /data/10 
+ChatGPT said:
+
+Here’s your final weekly accomplishment entry (for the week ending September 5, 2025) regarding the datavg rebuild automation for Ozone DataNodes:
+
+Title
+
+Automated Rebuild of Data Volume Mounts for Ozone DataNodes (/data/1–10)
+
+Submitted for Week Ending
+
+9/5/2025
+
+Description
+
+Standardizing Ozone Host Disk Layout through Automation:
+The EAP Strategic Solutions team successfully developed and implemented an Ansible automation script to rebuild the datavg volume group with 10 standardized mount points (/data/1 to /data/10) on Ozone DataNode host types. This automation was crucial to the completion of the Ozone hardware refresh and significantly reduced manual effort in preparing new or cleaned-up servers for production use.
+
+Key Achievements:
+
+Created an Ansible playbook to wipe, recreate, and format datavg into 10 evenly sized logical volumes.
+
+Standardized the mount structure (/data/1 to /data/10) as required by Ozone DataNode service layout.
+
+Implemented fstab updates with mount tagging for persistence and clarity (e.g., ansible:ozone-managed).
+
+Validated across newly provisioned hosts and cleaned-up legacy servers as part of hardware onboarding.
+
+Benefits to the Team:
+
+Saves time and manual intervention during Ozone DataNode provisioning.
+
+Ensures consistent disk layout aligned with Cloudera deployment best practices.
+
+Reduces onboarding time for hardware transitions and cluster expansion.
+
+Minimizes configuration drift by applying infrastructure-as-code methodology.
+
+Next Steps:
+
+Combine with cleanup automation for full end-to-end server repurposing.
+
+Extend support for dynamic disk sizing and RAID configurations.
+
+Promote automation across SDLC environments (DEV → UAT → PROD).
