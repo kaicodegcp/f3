@@ -1,0 +1,317 @@
+---
+# ozone_datavg_cleanup.yml
+# Purpose: Dry-run + gated wipe of "data volumes" only.
+# Scope: Any host type (Ozone/HDFS/cloud VM). Never touches root VG.
+# Param: WIPE (string). Empty or not equal to "WIPE" => DRY RUN email only. "WIPE" => perform cleanup.
+# Email: Report sent to <submitter>@citi.com (submitter auto-detected).
+
+- name: Data VG cleanup (dry-run + gated wipe)
+  hosts: all
+  gather_facts: true
+  become: true
+  vars:
+    # Single parameter per request
+    WIPE: "{{ lookup('env','WIPE') | default('', true) }}"
+    # Detect submitter (best-effort across portals/sudo/locals)
+    submitting_user: >-
+      {{ lookup('env','STATFLEET_USER') or
+         lookup('env','BUILD_USER') or
+         lookup('env','SUDO_USER') or
+         (ansible_env.USER | default(ansible_user_id | default('unknown'), true)) }}
+    submitter_email: "{{ submitting_user }}@citi.com"
+    report_path: "/tmp/datavg_cleanup_report_{{ inventory_hostname }}.txt"
+    # What counts as "data" mounts (edit if you have other app paths)
+    data_mount_regex: '^/data($|/)'
+    # Safety: never touch the LV/VG that backs "/"
+    root_source_cmd: "findmnt -no SOURCE / || true"
+    # Commands used (allow override per platform if needed)
+    cmd_lsblk: "lsblk -rno NAME,TYPE,MOUNTPOINT,FSTYPE,SIZE,PKNAME"
+    cmd_findmnt_data: "awk '$1 !~ /^#/ && $2 ~ /{{ data_mount_regex }}/ {print $0}' /etc/fstab || true"
+    fstab_backup_suffix: "{{ lookup('pipe','date +%Y%m%d%H%M%S') }}"
+  pre_tasks:
+    - name: Sanity | Ensure we are root
+      assert:
+        that: ansible_user_id == 'root'
+        fail_msg: "Playbook must run as root (become: true)."
+        success_msg: "Running as root."
+
+    - name: Discover root mount backing device
+      command: "{{ root_source_cmd }}"
+      register: root_src
+      changed_when: false
+
+    - name: Parse root VG/LV from device path (if LVM)
+      set_fact:
+        root_mapper: "{{ root_src.stdout | default('') }}"
+        root_vg: >-
+          {{ (root_src.stdout | regex_search('mapper/([^-/]+)-', '\\1')) | default('') }}
+      when: root_src.stdout != ""
+
+  tasks:
+    - name: Collect current fstab data mounts (uncommented lines)
+      shell: "{{ cmd_findmnt_data }}"
+      register: fstab_data_lines
+      changed_when: false
+
+    - name: Build candidate data mount entries
+      set_fact:
+        fstab_entries: >-
+          {{
+            fstab_data_lines.stdout_lines
+            | default([])
+            | map('regex_replace','\\s+',' ')
+            | map('split',' ')
+            | map('list')
+            | list
+          }}
+      # each entry ~ [device, mountpoint, fstype, options, dump, pass]
+
+    - name: Extract data mountpoints/devices
+      set_fact:
+        data_mounts: >-
+          {{
+            fstab_entries
+            | select('length','>=',2)
+            | selectattr('1','match', data_mount_regex)
+            | map('slice',0,2)            # [device, mountpoint]
+            | list
+          }}
+        data_devices_from_fstab: >-
+          {{
+            data_mounts | map('first') | list | unique
+          }}
+        data_mountpoints_from_fstab: >-
+          {{
+            data_mounts | map('last') | list | unique
+          }}
+
+    - name: Collect block info
+      shell: "{{ cmd_lsblk }}"
+      register: lsblk_out
+      changed_when: false
+
+    - name: Derive LV/VG candidates from devices (best-effort)
+      vars:
+        # Examples of device styles:
+        #   /dev/mapper/vg_data-lv_data1  -> vg_data: lv_data1
+        #   /dev/vg_data/lv_data1         -> vg_data: lv_data1
+        #   UUID=...                      -> will resolve later
+      set_fact:
+        lvm_candidates: >-
+          {{
+            data_devices_from_fstab
+            | map('regex_search','/dev/mapper/([^-/]+)-([^\\s]+)','\\1,\\2')
+            | map('default','',true)
+            | list
+          }}
+        slash_candidates: >-
+          {{
+            data_devices_from_fstab
+            | map('regex_search','/dev/([^/]+)/([^\\s]+)','\\1,\\2')
+            | map('default','',true)
+            | list
+          }}
+
+    - name: Resolve UUID= / LABEL= devices to real paths
+      shell: |
+        set -e
+        dev="$1"
+        if echo "$dev" | grep -Eq '^(UUID|LABEL)='; then
+          blkid -o device -t "$dev" || true
+        else
+          echo "$dev"
+        fi
+      args:
+        stdin: ""
+      loop: "{{ data_devices_from_fstab }}"
+      loop_control:
+        loop_var: devspec
+      register: resolved_devs
+      changed_when: false
+
+    - name: Gather LVs + VGs from resolved devices
+      shell: |
+        set -e
+        dev="$1"
+        if [ -e "$dev" ]; then
+          lvdisplay -C --noheadings -o vg_name,lv_name,lv_path 2>/dev/null | awk '{print $1","$2","$3}'
+        else
+          true
+        fi
+      args:
+        stdin: ""
+      loop: "{{ (resolved_devs.results | map(attribute='stdout') | list) | unique }}"
+      loop_control:
+        loop_var: rdev
+      register: lvs_info
+      changed_when: false
+
+    - name: Build unique LV/VG sets tied to data mounts
+      set_fact:
+        lv_triplets: >-
+          {{
+            lvs_info.results
+            | map(attribute='stdout')
+            | map('split','\n')
+            | sum(start=[])
+            | select('match','^.+,.+,.+$')
+            | list
+          }}
+        vgs_to_touch: "{{ lv_triplets | map('split',',') | map('first') | list | unique | difference([root_vg]) }}"
+        lvs_to_touch: "{{ lv_triplets | map('split',',') | map('last') | list | unique }}"
+      when: lvs_info is defined
+
+    - name: Derive PVs for those VGs (to wipe signatures later)
+      shell: |
+        set -e
+        for vg in {{ (vgs_to_touch | default([])) | join(' ') }}; do
+          pvs --noheadings -o pv_name,vg_name 2>/dev/null | awk -v V="$vg" '$2==V {print $1}'
+        done
+      register: pvs_info
+      when: (vgs_to_touch | default([])) | length > 0
+      changed_when: false
+
+    - name: Compute report content
+      set_fact:
+        report_lines:
+          - "==============================================="
+          - "DATA VG CLEANUP REPORT ({{ 'DRY RUN' if WIPE != 'WIPE' else 'EXECUTION' }})"
+          - "Host           : {{ inventory_hostname }}"
+          - "Submitter      : {{ submitting_user }}"
+          - "Email          : {{ submitter_email }}"
+          - "Date           : {{ '%Y-%m-%d %H:%M:%S' | strftime }}"
+          - "Root VG        : {{ root_vg | default('N/A') }}"
+          - "-----------------------------------------------"
+          - "FSTAB matches  : {{ (data_mountpoints_from_fstab | length) | string }} mount(s)"
+          - "Mountpoints    : {{ (data_mountpoints_from_fstab | join(', ')) if (data_mountpoints_from_fstab|length>0) else 'None' }}"
+          - "Devices (fstab): {{ (data_devices_from_fstab | join(', ')) if (data_devices_from_fstab|length>0) else 'None' }}"
+          - "LV paths       : {{ (lvs_to_touch | join(', ')) if (lvs_to_touch|length>0) else 'None' }}"
+          - "VGs (target)   : {{ (vgs_to_touch | join(', ')) if (vgs_to_touch|length>0) else 'None' }}"
+          - "PVs (target)   : {{ (pvs_info.stdout_lines | join(', ')) if (pvs_info is defined and pvs_info.stdout_lines) else 'None' }}"
+          - "-----------------------------------------------"
+          - "{{ 'ACTION: DRY RUN ONLY. Set WIPE=WIPE to execute.' if WIPE != 'WIPE' else 'ACTION: WIPING as requested (WIPE=WIPE).' }}"
+          - "SAFETY: Will never touch root VG {{ root_vg | default('N/A') }}."
+          - "==============================================="
+
+    - name: Write report file
+      copy:
+        dest: "{{ report_path }}"
+        content: "{{ report_lines | join('\n') }}"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Email DRY RUN / EXECUTION report
+      shell: |
+        if command -v mail >/dev/null 2>&1; then
+          mail -s "[{{ inventory_hostname }}] Data VG cleanup {{ 'DRY RUN' if WIPE != 'WIPE' else 'EXECUTION' }}" "{{ submitter_email }}" < "{{ report_path }}"
+        else
+          echo "mail(1) not found; leaving report at {{ report_path }}"
+        fi
+      changed_when: false
+
+    - name: STOP HERE if this is a DRY RUN (no WIPE)
+      meta: end_play
+      when: WIPE != 'WIPE'
+
+    # ---------- EXECUTION PHASE BELOW (WIPE=WIPE) ----------
+    - name: Backup /etc/fstab
+      copy:
+        src: /etc/fstab
+        dest: "/etc/fstab.bak.{{ fstab_backup_suffix }}"
+        owner: root
+        group: root
+        mode: '0600'
+        remote_src: true
+
+    - name: Unmount all data mountpoints (force/lazy best-effort)
+      shell: |
+        set -e
+        mp="$1"
+        if mountpoint -q "$mp"; then
+          umount -fl "$mp" || umount -f "$mp" || true
+        fi
+      loop: "{{ data_mountpoints_from_fstab | default([]) }}"
+      loop_control:
+        loop_var: mp
+      register: umount_results
+      changed_when: >-
+        {{ (umount_results.results | selectattr('rc','==',0) | list | length) > 0 }}
+      when: (data_mountpoints_from_fstab | length) > 0
+
+    - name: Remove matching fstab lines for /data mounts
+      lineinfile:
+        path: /etc/fstab
+        state: absent
+        regexp: '^[^#].*\\s{{ data_mount_regex }}\\s'
+      register: fstab_strip
+
+    - name: Remove LVs behind data mounts
+      shell: |
+        set -e
+        lvpath="$1"
+        if [ -e "$lvpath" ]; then
+          lvremove -fy "$lvpath" || true
+        fi
+      loop: "{{ lvs_to_touch | default([]) }}"
+      loop_control:
+        loop_var: lvpath
+      register: lvrem
+      changed_when: >-
+        {{ (lvrem.results | selectattr('rc','==',0) | list | length) > 0 }}
+      when: (lvs_to_touch | length) > 0
+
+    - name: Remove now-empty VGs (excluding root VG)
+      shell: |
+        set -e
+        vg="$1"
+        # only remove if no LVs remain
+        if [ "$(lvs --noheadings -o lv_name "$vg" 2>/dev/null | wc -w)" -eq 0 ]; then
+          vgremove -fy "$vg" || true
+        fi
+      loop: "{{ vgs_to_touch | default([]) }}"
+      loop_control:
+        loop_var: vg
+      register: vgrem
+      changed_when: >-
+        {{ (vgrem.results | selectattr('rc','==',0) | list | length) > 0 }}
+      when: (vgs_to_touch | length) > 0
+
+    - name: Wipe filesystem/LVM signatures on PVs
+      shell: |
+        set -e
+        dev="$1"
+        if [ -b "$dev" ]; then
+          wipefs -a "$dev" || true
+        fi
+      loop: "{{ (pvs_info.stdout_lines | default([])) | unique }}"
+      loop_control:
+        loop_var: pv
+      register: wipefs_out
+      changed_when: >-
+        {{ (wipefs_out.results | selectattr('rc','==',0) | list | length) > 0 }}
+      when: pvs_info is defined and pvs_info.stdout_lines | length > 0
+
+    - name: Final execution report (append results)
+      shell: |
+        {
+          echo "";
+          echo "REMOVAL RESULTS:";
+          echo "  fstab lines removed: {{ (fstab_strip is changed) | ternary('yes','no') }}";
+          echo "  unmount attempts   : {{ (umount_results.results | default([])) | length }}";
+          echo "  lvremove attempts  : {{ (lvrem.results | default([])) | length }}";
+          echo "  vgremove attempts  : {{ (vgrem.results | default([])) | length }}";
+          echo "  wipefs attempts    : {{ (wipefs_out.results | default([])) | length }}";
+          echo "STATUS: COMPLETED WIPING DATA VOLUMES (root VG {{ root_vg | default('N/A') }} untouched)";
+          echo "-----------------------------------------------";
+        } >> "{{ report_path }}"
+      changed_when: true
+
+    - name: Email EXECUTION completion report
+      shell: |
+        if command -v mail >/dev/null 2>&1; then
+          mail -s "[{{ inventory_hostname }}] Data VG cleanup EXECUTION COMPLETE" "{{ submitter_email }}" < "{{ report_path }}"
+        else
+          echo "mail(1) not found; leaving report at {{ report_path }}"
+        fi
+      changed_when: false
