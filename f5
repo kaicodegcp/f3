@@ -174,3 +174,120 @@ email_subject_prefix: "[Ozone OM datavg rebuild]"
 
 
 
+
+
+
+=======
+---
+# roles/ozone_datavg_build/tasks/main.yml
+
+# ---------- Prechecks ----------
+- name: Check if VG exists (host must be clean)
+  command: "vgs --noheadings {{ lvm_vg }}"
+  register: vg_check
+  failed_when: false
+  changed_when: false
+
+- name: Stop if VG exists (email + end)
+  when: vg_check.rc == 0
+  block:
+    - name: df -h snapshot
+      command: df -h
+      register: df_exist
+      changed_when: false
+
+    - name: Email failure (VG already exists)
+      shell: >
+        printf "Host: {{ inventory_hostname }}\nReason: VG {{ lvm_vg }} exists.\n\n"
+        | mail -s "{{ email_subject_prefix }} FAILURE on {{ inventory_hostname }}"
+        "{{ email_to }}"
+      changed_when: false
+
+    - meta: end_play
+
+# ---------- Capacity check ----------
+- name: Join PV list
+  set_fact:
+    _pvs_joined: "{{ lvm_pvs | join(' ') }}"
+
+- name: Sum PV capacity in GiB
+  shell: >
+    lsblk -b -dn -o SIZE {{ _pvs_joined }}
+    | awk '{s+=$1} END {print int(s/1024/1024/1024)}'
+  register: pv_total_cmd
+  changed_when: false
+
+- name: Set PV/LV totals and needed (5% headroom)
+  set_fact:
+    pv_total_g: "{{ (pv_total_cmd.stdout | int) }}"
+    lv_total_g: "{{ lvm_layout | map(attribute='size_g') | map('int') | sum }}"
+    needed_g: "{{ (( (lvm_layout | map(attribute='size_g') | map('int') | sum) * 105) // 100) }}"
+
+- name: Stop if capacity insufficient (email + end)
+  when: pv_total_g < needed_g
+  block:
+    - name: df -h snapshot
+      command: df -h
+      register: df_cap
+      changed_when: false
+
+    - name: Email failure (insufficient space)
+      shell: >
+        printf "Host: {{ inventory_hostname }}\nNot enough space.\nNeeded: {{ needed_g }} GiB\n
+        Available: {{ pv_total_g }} GiB\n\n"
+        | mail -s "{{ email_subject_prefix }} FAILURE on {{ inventory_hostname }}"
+        "{{ email_to }}"
+      changed_when: false
+
+    - meta: end_play
+
+# ---------- Build VG/LVs/FS ----------
+- name: pvcreate each PV
+  shell: "pvcreate -y {{ item }}"
+  args:
+    warn: false
+  loop: "{{ lvm_pvs }}"
+
+- name: vgcreate
+  shell: "vgcreate {{ lvm_vg }} {{ _pvs_joined }}"
+
+- name: lvcreate for each LV
+  shell: "lvcreate -y -L {{ item.size_g }}G -n lv_{{ item.name }} {{ lvm_vg }}"
+  loop: "{{ lvm_layout }}"
+
+- name: mkfs on each LV
+  shell: "mkfs -t {{ lvm_fs }} /dev/{{ lvm_vg }}/lv_{{ item.name }}"
+  loop: "{{ lvm_layout }}"
+
+# ---------- Mounts & fstab ----------
+- name: Create mountpoint dirs
+  file:
+    path: "{{ item.mount }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ lvm_layout }}"
+
+- name: Ensure fstab entries
+  lineinfile:
+    path: /etc/fstab
+    create: yes
+    line: "/dev/{{ lvm_vg }}/lv_{{ item.name }} {{ item.mount }} {{ lvm_fs }} defaults,noatime 0 0"
+    state: present
+  loop: "{{ lvm_layout }}"
+
+- name: Mount all from fstab
+  shell: mount -a
+
+# ---------- Email success ----------
+- name: df -h after build
+  command: df -h
+  register: df_ok
+  changed_when: false
+
+- name: Email success
+  shell: >
+    printf "Host: {{ inventory_hostname }}\nVG: {{ lvm_vg }}\n
+    PV total: {{ pv_total_g }} GiB\nLV total: {{ lv_total_g }} GiB\n\n"
+    | mail -s "{{ email_subject_prefix }} SUCCESS on {{ inventory_hostname }}"
+    "{{ email_to }}"
+  changed_when: false
