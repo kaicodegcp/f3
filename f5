@@ -1,0 +1,176 @@
+
+ozone_om.yml
+---
+lvm_vg: datavg
+lvm_pvs:
+  - /dev/sdb
+  - /dev/sdc
+  - /dev/sdd
+  - /dev/sde
+  - /dev/sdf
+  - /dev/sdg
+  - /dev/sdh
+  - /dev/sdi
+  - /dev/sdj
+  - /dev/sdk
+  - /dev/sdl
+  - /dev/sdm
+
+lvm_fs: ext4
+
+lvm_layout:
+  - { name: app_log,        mount: /var/app/log,                                size_g: 1000 }
+  - { name: app_lib,        mount: /var/app/lib,                                size_g: 100  }
+  - { name: opt_cloudera,   mount: /opt/cloudera,                               size_g: 100  }
+  - { name: Opt_Cloudera,   mount: /opt/Cloudera,                               size_g: 100  }
+  - { name: ozone_metadata, mount: /var/app/lib/hadoop-ozone/om/ozone-metadata, size_g: 500  }
+  - { name: ozone_ratis,    mount: /var/app/lib/hadoop-ozone/om/ratis,          size_g: 500  }
+  - { name: ozone_data,     mount: /var/app/lib/hadoop-ozone/om/data,           size_g: 3000 }
+  - { name: ozone_snapshot, mount: /data/1/om/snapshot,                         size_g: 4000 }
+
+email_to: {{ user_id }}@citi.com
+email_subject_prefix: "[Ozone OM datavg rebuild]"
+
+
+
+---
+# Everything here is plain builtins: command/shell/file/lineinfile/mount
+
+# ---------- Prechecks: clean host & capacity ----------
+- name: Check if VG already exists (host must be clean)
+  command: "vgs --noheadings {{ lvm_vg }}"
+  register: _vg_chk
+  failed_when: false
+  changed_when: false
+
+- name: Set failure message if VG exists
+  set_fact:
+    _fail_msg: "VG '{{ lvm_vg }}' already exists. Host is NOT clean. Aborting."
+
+- name: Stop early if VG exists (and email)
+  when: _vg_chk.rc == 0
+  block:
+    - name: Collect df -h
+      command: df -h
+      register: _df_exist
+      changed_when: false
+
+    - name: Send failure email (VG exists)
+      shell: |
+        {
+          echo "Host: {{ inventory_hostname }}";
+          echo "Reason: {{ _fail_msg }}";
+          echo;
+          echo "df -h:";
+          echo "{{ _df_exist.stdout | replace('%','%%') }}";
+        } | mail -s "{{ email_subject_prefix }} FAILURE on {{ inventory_hostname }}" "{{ email_to }}"
+      changed_when: false
+
+    - meta: end_play
+
+# Compute PV total GiB
+- name: Read PV sizes (bytes)
+  command: "lsblk -b -dn -o SIZE {{ item }}"
+  loop: "{{ lvm_pvs }}"
+  register: _pv_sizes
+  changed_when: false
+
+- name: Sum PV GiB and LV GiB
+  set_fact:
+    _pv_total_g: "{{ (_pv_sizes.results | map(attribute='stdout') | map('int') | list | sum | float / (1024*1024*1024)) | round(0,'floor') }}"
+    _lv_total_g: "{{ lvm_layout | map(attribute='size_g') | map('int') | list | sum }}"
+
+- name: Check capacity with 5% headroom
+  shell: |
+    python - <<'PY'
+    import sys
+    pv = int({{ _pv_total_g }})
+    lv = int({{ _lv_total_g }})
+    need = int((lv * 1.05) + 0.5)
+    print(f"PV_TOTAL_G={pv}")
+    print(f"LV_TOTAL_G={lv}")
+    print(f"NEEDED_G={need}")
+    sys.exit(0 if pv >= need else 2)
+    PY
+  register: _cap_chk
+  changed_when: false
+  failed_when: false
+
+- name: Capacity not sufficient → email + stop
+  when: _cap_chk.rc != 0
+  block:
+    - name: Collect df -h
+      command: df -h
+      register: _df_cap
+      changed_when: false
+
+    - name: Send failure email (insufficient capacity)
+      shell: |
+        {
+          echo "Host: {{ inventory_hostname }}";
+          echo "Reason: Not enough space on PVs for requested LVs (incl. 5% headroom).";
+          echo "{{ _cap_chk.stdout_lines | join('\n') }}";
+          echo;
+          echo "df -h:";
+          echo "{{ _df_cap.stdout | replace('%','%%') }}";
+        } | mail -s "{{ email_subject_prefix }} FAILURE on {{ inventory_hostname }}" "{{ email_to }}"
+      changed_when: false
+
+    - meta: end_play
+
+# ---------- Build: pvcreate/vgcreate/lvcreate/mkfs/mount ----------
+- name: Initialize PVs (pvcreate)
+  shell: "pvcreate -y {{ item }}"
+  args: { warn: false }
+  loop: "{{ lvm_pvs }}"
+
+- name: Create VG
+  shell: "vgcreate {{ lvm_vg }} {{ lvm_pvs | join(' ') }}"
+
+- name: Create each LV
+  shell: "lvcreate -y -L {{ item.size_g }}G -n lv_{{ item.name }} {{ lvm_vg }}"
+  loop: "{{ lvm_layout }}"
+
+- name: Make filesystem on each LV
+  shell: "mkfs -t {{ lvm_fs }} /dev/{{ lvm_vg }}/lv_{{ item.name }}"
+  loop: "{{ lvm_layout }}"
+
+- name: Ensure mountpoint exists
+  file:
+    path: "{{ item.mount }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ lvm_layout }}"
+
+- name: Persist in /etc/fstab
+  lineinfile:
+    path: /etc/fstab
+    create: yes
+    line: "/dev/{{ lvm_vg }}/lv_{{ item.name }}  {{ item.mount }}  {{ lvm_fs }}  defaults,noatime  0 0"
+    state: present
+  loop: "{{ lvm_layout }}"
+
+- name: Mount all entries
+  shell: mount -a
+
+# ---------- Email result ----------
+- name: Collect df -h after build
+  command: df -h
+  register: _df_ok
+  changed_when: false
+
+- name: Send success email
+  shell: |
+    {
+      echo "Host: {{ inventory_hostname }}";
+      echo "VG: {{ lvm_vg }}";
+      echo "PV total GiB: {{ _pv_total_g }}";
+      echo "LV total GiB (template): {{ _lv_total_g }}";
+      echo;
+      echo "df -h:";
+      echo "{{ _df_ok.stdout | replace('%','%%') }}";
+    } | mail -s "{{ email_subject_prefix }} SUCCESS on {{ inventory_hostname }}" "{{ email_to }}"
+  changed_when: false
+
+
+
