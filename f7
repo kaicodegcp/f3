@@ -1,0 +1,157 @@
+lvm_vg: datavg
+lvm_pvs:
+  - /dev/sdb
+  - /dev/sdc
+  - /dev/sdd
+  - /dev/sde
+  - /dev/sdf
+  - /dev/sdg
+  - /dev/sdh
+  - /dev/sdi
+  - /dev/sdj
+  - /dev/sdk
+  - /dev/sdl
+  - /dev/sdm
+lvm_fs: ext4
+lvm_layout:
+  - { name: app_log,        mount: /var/app/log,                                size_g: 1000 }
+  - { name: app_lib,        mount: /var/app/lib,                                size_g: 100  }
+  - { name: opt_cloudera,   mount: /opt/cloudera,                               size_g: 100  }
+  - { name: Opt_Cloudera,   mount: /opt/Cloudera,                               size_g: 100  }
+  - { name: ozone_metadata, mount: /var/app/lib/hadoop-ozone/om/ozone-metadata, size_g: 500  }
+  - { name: ozone_ratis,    mount: /var/app/lib/hadoop-ozone/om/ratis,          size_g: 500  }
+  - { name: ozone_data,     mount: /var/app/lib/hadoop-ozone/om/data,           size_g: 3000 }
+  - { name: ozone_snapshot, mount: /data/1/om/snapshot,                         size_g: 4000 }
+email_to: you@example.com
+email_subject: Ozone OM datavg rebuild
+
+---
+- name: check vg exists
+  command: "vgs --noheadings {{ lvm_vg }}"
+  register: vgchk
+  failed_when: false
+  changed_when: false
+
+- name: vg exists -> mail and end
+  when: vgchk.rc == 0
+  block:
+    - name: df
+      command: df -h
+      register: df_exist
+      changed_when: false
+    - name: mail fail vg exists
+      shell: 'echo "Host={{ inventory_hostname }} VG={{ lvm_vg }} exists" | mail -s "{{ email_subject }} FAILURE" "{{ email_to }}"'
+      changed_when: false
+    - meta: end_play
+
+# ---------- capacity check ----------
+- name: pv total gib
+  command: "lsblk -b -dn -o SIZE {{ lvm_pvs | join(' ') }}"
+  register: pv_sizes
+  changed_when: false
+
+- name: calc pv_total_g
+  set_fact:
+    pv_total_g: "{{ (pv_sizes.stdout_lines | map('int') | list | sum // (1024*1024*1024)) | int }}"
+
+- name: calc lv_total_g
+  set_fact:
+    lv_total_g: "{{ lvm_layout | map(attribute='size_g') | map('int') | sum }}"
+
+- name: calc needed_g
+  set_fact:
+    needed_g: "{{ ((lv_total_g * 105) // 100) | int }}"
+
+- name: capacity insufficient -> mail and end
+  when: pv_total_g < needed_g
+  block:
+    - name: df
+      command: df -h
+      register: df_cap
+      changed_when: false
+    - name: mail fail capacity
+      shell: 'echo "Host={{ inventory_hostname }} Need={{ needed_g }}GiB Have={{ pv_total_g }}GiB" | mail -s "{{ email_subject }} FAILURE" "{{ email_to }}"'
+      changed_when: false
+    - meta: end_play
+
+# ---------- pvcreate (idempotent) ----------
+- name: check existing pv
+  command: "pvs --noheadings -o pv_name {{ item }}"
+  loop: "{{ lvm_pvs }}"
+  register: pvcheck
+  failed_when: false
+  changed_when: false
+
+- name: build list of pvs to create
+  set_fact:
+    _pvs_to_create: >-
+      {{ lvm_pvs | reject('in', (pvcheck.results | map(attribute='stdout') | list)) | list }}
+
+- name: pvcreate missing pvs
+  command: "pvcreate -y {{ item }}"
+  loop: "{{ _pvs_to_create }}"
+  when: _pvs_to_create | length > 0
+
+# ---------- vgcreate (idempotent) ----------
+- name: create vg if missing
+  command: "vgcreate {{ lvm_vg }} {{ lvm_pvs | join(' ') }}"
+  when: vgchk.rc != 0
+
+# ---------- lvcreate (idempotent) ----------
+- name: check existing lvs
+  command: "lvs --noheadings -o lv_name {{ lvm_vg }}"
+  register: lv_names
+  failed_when: false
+  changed_when: false
+
+- name: lvcreate each missing
+  command: "lvcreate -y -L {{ item.size_g }}G -n lv_{{ item.name }} {{ lvm_vg }}"
+  loop: "{{ lvm_layout }}"
+  when: "'lv_' ~ item.name not in (lv_names.stdout_lines | map('trim') | list)"
+
+# ---------- mkfs (idempotent) ----------
+- name: probe fs type
+  command: "blkid -o value -s TYPE /dev/{{ lvm_vg }}/lv_{{ item.name }}"
+  register: blkid_out
+  loop: "{{ lvm_layout }}"
+  failed_when: false
+  changed_when: false
+
+- name: mkfs missing fs
+  command: "mkfs -t {{ lvm_fs }} /dev/{{ lvm_vg }}/lv_{{ item.name }}"
+  loop: "{{ lvm_layout }}"
+  when: (blkid_out.results[loop.index0].rc != 0) or
+        (blkid_out.results[loop.index0].stdout != lvm_fs)
+
+# ---------- mounts & fstab ----------
+- name: ensure mount dirs
+  file:
+    path: "{{ item.mount }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ lvm_layout }}"
+
+- name: ensure fstab lines
+  lineinfile:
+    path: /etc/fstab
+    create: yes
+    state: present
+    line: "/dev/{{ lvm_vg }}/lv_{{ item.name }} {{ item.mount }} {{ lvm_fs }} defaults,noatime 0 0"
+  loop: "{{ lvm_layout }}"
+
+- name: mount path if not mounted
+  command: "mount {{ item.mount }}"
+  register: mnt_try
+  failed_when: false
+  changed_when: "'mounted' in mnt_try.stderr or mnt_try.rc == 0"
+  loop: "{{ lvm_layout }}"
+
+# ---------- success email ----------
+- name: df after
+  command: df -h
+  register: df_ok
+  changed_when: false
+
+- name: mail success
+  shell: 'echo "Host={{ inventory_hostname }} VG={{ lvm_vg }} PV={{ pv_total_g }}GiB LV={{ lv_total_g }}GiB" | mail -s "{{ email_subject }} SUCCESS" "{{ email_to }}"'
+  changed_when: false
