@@ -1,97 +1,3 @@
-f6
-
----
-- name: check vg exists
-  command: "vgs --noheadings {{ lvm_vg }}"
-  register: vgchk
-  failed_when: false
-  changed_when: false
-
-- name: vg exists -> mail + end
-  when: vgchk.rc == 0
-  block:
-    - name: df
-      command: df -h
-      register: df1
-      changed_when: false
-    - name: mail fail (vg exists)
-      shell: echo "Host: {{ inventory_hostname }}; VG {{ lvm_vg }} exists" | mail -s "{{ email_subject }} FAILURE" "{{ email_to }}"
-      changed_when: false
-    - meta: end_play
-
-- name: pv total gib
-  shell: "lsblk -b -dn -o SIZE {{ lvm_pvs | join(' ') }} | awk '{s+=$1} END{print int(s/1024/1024/1024)}'"
-  register: pv_total
-  changed_when: false
-
-- name: lv total gib
-  shell: "printf '%s\n' {{ lvm_layout | map(attribute='size_g') | join(' ') }} | tr ' ' '\n' | awk '{s+=$1} END{print s}'"
-  register: lv_total
-  changed_when: false
-
-- name: needed gib (5pct headroom)
-  shell: "echo $(( ({{ lv_total.stdout|int }} * 105 + 99) / 100 ))"
-  register: need_total
-  changed_when: false
-
-- name: capacity fail -> mail + end
-  when: pv_total.stdout|int < need_total.stdout|int
-  block:
-    - name: df
-      command: df -h
-      register: df2
-      changed_when: false
-    - name: mail fail (space)
-      shell: echo "Host: {{ inventory_hostname }}; Need: {{ need_total.stdout }} GiB; Have: {{ pv_total.stdout }} GiB" | mail -s "{{ email_subject }} FAILURE" "{{ email_to }}"
-      changed_when: false
-    - meta: end_play
-
-- name: pvcreate
-  shell: "pvcreate -y {{ item }}"
-  args: { warn: false }
-  loop: "{{ lvm_pvs }}"
-
-- name: vgcreate
-  shell: "vgcreate {{ lvm_vg }} {{ lvm_pvs | join(' ') }}"
-
-- name: lvcreate
-  shell: "lvcreate -y -L {{ item.size_g }}G -n lv_{{ item.name }} {{ lvm_vg }}"
-  loop: "{{ lvm_layout }}"
-
-- name: mkfs
-  shell: "mkfs -t {{ lvm_fs }} /dev/{{ lvm_vg }}/lv_{{ item.name }}"
-  loop: "{{ lvm_layout }}"
-
-- name: mkdirs
-  file:
-    path: "{{ item.mount }}"
-    state: directory
-    mode: "0755"
-  loop: "{{ lvm_layout }}"
-
-- name: fstab lines
-  lineinfile:
-    path: /etc/fstab
-    create: yes
-    line: "/dev/{{ lvm_vg }}/lv_{{ item.name }} {{ item.mount }} {{ lvm_fs }} defaults,noatime 0 0"
-    state: present
-  loop: "{{ lvm_layout }}"
-
-- name: mount all
-  shell: mount -a
-
-- name: df after
-  command: df -h
-  register: df_ok
-  changed_when: false
-
-- name: mail success
-  shell: echo "Host: {{ inventory_hostname }}; VG: {{ lvm_vg }}; PV: {{ pv_total.stdout }} GiB; LV: {{ lv_total.stdout }} GiB" | mail -s "{{ email_subject }} SUCCESS" "{{ email_to }}"
-  changed_when: false
-
-
-
-vars
 lvm_vg: datavg
 lvm_pvs:
   - /dev/sdb
@@ -119,4 +25,89 @@ lvm_layout:
 email_to: you@example.com
 email_subject: Ozone OM datavg rebuild
 
+---
+- name: check vg exists
+  command: "vgs --noheadings {{ lvm_vg }}"
+  register: vgchk
+  failed_when: false
+  changed_when: false
 
+- name: vg exists -> mail + end
+  when: vgchk.rc == 0
+  block:
+    - name: df
+      command: df -h
+      register: df1
+      changed_when: false
+    - name: mail fail (vg exists)
+      shell: 'echo "Host: {{ inventory_hostname }}; VG {{ lvm_vg }} exists" | mail -s "{{ email_subject }} FAILURE" "{{ email_to }}"'
+      changed_when: false
+    - meta: end_play
+
+- name: pv total gib
+  shell: 'lsblk -b -dn -o SIZE {{ lvm_pvs | join(" ") }} | awk "{s+=$1} END{print int(s/1024/1024/1024)}"'
+  register: pv_total
+  changed_when: false
+
+- name: compute lv_total_g
+  set_fact:
+    lv_total_g: "{{ lvm_layout | map(attribute='size_g') | map('int') | sum }}"
+
+- name: compute needed_g (5pct headroom)
+  set_fact:
+    needed_g: "{{ ((lv_total_g * 105) // 100) | int }}"
+
+- name: capacity fail -> mail + end
+  when: (pv_total.stdout | int) < (needed_g | int)
+  block:
+    - name: df
+      command: df -h
+      register: df2
+      changed_when: false
+    - name: mail fail (space)
+      shell: 'echo "Host: {{ inventory_hostname }}; Need: {{ needed_g }} GiB; Have: {{ pv_total.stdout }} GiB" | mail -s "{{ email_subject }} FAILURE" "{{ email_to }}"'
+      changed_when: false
+    - meta: end_play
+
+- name: pvcreate
+  shell: 'pvcreate -y {{ item }}'
+  args: { warn: false }
+  loop: "{{ lvm_pvs }}"
+
+- name: vgcreate
+  shell: 'vgcreate {{ lvm_vg }} {{ lvm_pvs | join(" ") }}'
+
+- name: lvcreate
+  shell: 'lvcreate -y -L {{ item.size_g }}G -n lv_{{ item.name }} {{ lvm_vg }}'
+  loop: "{{ lvm_layout }}"
+
+- name: mkfs
+  shell: 'mkfs -t {{ lvm_fs }} /dev/{{ lvm_vg }}/lv_{{ item.name }}'
+  loop: "{{ lvm_layout }}"
+
+- name: mkdirs
+  file:
+    path: "{{ item.mount }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ lvm_layout }}"
+
+- name: fstab lines
+  lineinfile:
+    path: /etc/fstab
+    create: yes
+    line: "/dev/{{ lvm_vg }}/lv_{{ item.name }} {{ item.mount }} {{ lvm_fs }} defaults,noatime 0 0"
+    state: present
+  loop: "{{ lvm_layout }}"
+
+- name: mount all
+  shell: 'mount -a'
+
+- name: df after
+  command: df -h
+  register: df_ok
+  changed_when: false
+
+- name: mail success
+  shell: 'echo "Host: {{ inventory_hostname }}; VG: {{ lvm_vg }}; PV: {{ pv_total.stdout }} GiB; LV: {{ lv_total_g }} GiB" | mail -s "{{ email_subject }} SUCCESS" "{{ email_to }}"'
+  changed_when: false
