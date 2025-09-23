@@ -1,0 +1,188 @@
+
+datavg_cleanup.sh
+  
+#!/usr/bin/env bash
+# Cleanup (and optionally low-risk format) ONLY the datavg volume group.
+# Default mode is DRY-RUN. You must pass --wipe (and type WIPE) to make changes.
+
+set -euo pipefail
+
+VG_NAME="datavg"
+DO_WIPE=false
+ASSUME_YES=false
+DO_MKFS=false
+LOG(){ echo "[$(date +'%F %T')] $*"; }
+
+usage() {
+  cat <<EOF
+Usage: $0 [--vg NAME] [--wipe] [--yes] [--mkfs] [--pv-devices "/dev/sdb /dev/sdc"]
+
+Options:
+  --vg NAME           VG to clean (default: datavg). Must NOT be 'rootvg'.
+  --wipe              Do the destructive actions (otherwise dry-run).
+  --yes               Non-interactive (assume 'WIPE' confirmation).
+  --mkfs              After wiping PV signatures, create mkfs.ext4 on PV disks.
+                      (No partitions or LVM recreated. Use with caution.)
+  --pv-devices LIST   Optional explicit PV devices (quoted, space-separated).
+                      If not provided, PVs are discovered from 'pvs' for the VG.
+Examples:
+  Dry run            : $0
+  Real wipe          : $0 --wipe
+  Real wipe no prompt: $0 --wipe --yes
+  Wipe + mkfs        : $0 --wipe --mkfs
+EOF
+}
+
+PV_LIST_OVERRIDE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --vg) VG_NAME="${2:-}"; shift 2;;
+    --wipe) DO_WIPE=true; shift;;
+    --yes) ASSUME_YES=true; shift;;
+    --mkfs) DO_MKFS=true; shift;;
+    --pv-devices) PV_LIST_OVERRIDE="${2:-}"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) LOG "Unknown arg: $1"; usage; exit 1;;
+  esac
+done
+
+if [[ "${VG_NAME}" == "rootvg" ]]; then
+  LOG "Refusing to operate on rootvg."; exit 2
+fi
+
+# Root check
+if [[ "$(id -u)" -ne 0 ]]; then
+  LOG "Please run as root."; exit 3
+fi
+
+# Detect VG existence
+VG_PRESENT=false
+if vgs --noheadings "${VG_NAME}" >/dev/null 2>&1; then
+  VG_PRESENT=true
+fi
+
+# Collect PVs
+declare -a PVs
+if [[ -n "${PV_LIST_OVERRIDE}" ]]; then
+  # shellcheck disable=SC2206
+  PVs=(${PV_LIST_OVERRIDE})
+else
+  if $VG_PRESENT; then
+    # shellcheck disable=SC2207
+    PVs=($(pvs --noheadings -o pv_name,vg_name | awk -v vg="$VG_NAME" '$2==vg {print $1}'))
+  else
+    PVs=()
+  fi
+fi
+
+# Safety: ensure none of the PVs belong to rootvg
+if [[ ${#PVs[@]} -gt 0 ]]; then
+  if pvs --noheadings -o pv_name,vg_name | awk '$2=="rootvg"{print $1}' | grep -Fxq "${PVs[@]}" 2>/dev/null; then
+    LOG "Some provided PVs belong to rootvg. Aborting."; exit 4
+  fi
+fi
+
+LOG "=== PLAN (dry-run preview) ==="
+if $VG_PRESENT; then
+  LOG "VG to remove      : ${VG_NAME}"
+  LOG "LVs               :"
+  lvs --noheadings -o lv_name,lv_path,lv_size,devices "${VG_NAME}" 2>/dev/null || true
+  LOG "Mountpoints on VG :"
+  lsblk -o NAME,MOUNTPOINT | grep -E "(${VG_NAME}|/mapper/${VG_NAME}-)" || true
+else
+  LOG "VG '${VG_NAME}' not found."
+fi
+
+if [[ ${#PVs[@]} -gt 0 ]]; then
+  LOG "PV devices        : ${PVs[*]}"
+else
+  LOG "PV devices        : (none detected)"
+fi
+
+FSTAB_LINES="$(grep -nE "/dev/(mapper/${VG_NAME}-|${VG_NAME}/)" /etc/fstab || true)"
+LOG "/etc/fstab matches:"
+echo "${FSTAB_LINES:-(none)}"
+
+if ! $DO_WIPE; then
+  LOG "Dry-run only. Re-run with --wipe to perform actions."
+  exit 0
+fi
+
+if ! $ASSUME_YES; then
+  echo
+  read -r -p "Type EXACTLY 'WIPE' to proceed: " CONFIRM
+  if [[ "${CONFIRM:-}" != "WIPE" ]]; then
+    LOG "Confirmation failed. Aborting."
+    exit 10
+  fi
+fi
+
+# Start destructive actions
+LOG "=== STARTING CLEANUP ==="
+
+# 1) Unmount anything backed by this VG
+if $VG_PRESENT; then
+  LOG "Unmounting filesystems on ${VG_NAME} ..."
+  # Find mountpoints from this VG and unmount
+  mapfile -t MPTS < <(lsblk -rno MOUNTPOINT,NAME | awk -v vg="${VG_NAME}" '
+    $0 ~ "/" {
+      mp=$1
+      nextline=0
+    }
+    { if (index($0, vg"-")>0 || index($0, "/mapper/"vg"-")>0) { if (mp!="") print mp; mp="" } }' | sort -u)
+  for mp in "${MPTS[@]:-}"; do
+    [[ -z "$mp" ]] && continue
+    if mountpoint -q "$mp"; then
+      # try fuser to clear busy mounts (best effort)
+      fuser -km "$mp" >/dev/null 2>&1 || true
+      umount -fl "$mp" || true
+      LOG "Unmounted $mp"
+    fi
+  done
+fi
+
+# 2) Clean /etc/fstab (backup first)
+TS="$(date +%Y%m%d%H%M%S)"
+cp -a /etc/fstab "/etc/fstab.${TS}.bak"
+sed -i -e "/\/dev\/mapper\/${VG_NAME}-/d" -e "/\/dev\/${VG_NAME}\//d" /etc/fstab
+LOG "Updated /etc/fstab (backup at /etc/fstab.${TS}.bak)."
+
+# 3) Remove LVs and VG
+if $VG_PRESENT; then
+  if lvs "${VG_NAME}" >/dev/null 2>&1; then
+    LOG "Removing LVs in ${VG_NAME} ..."
+    lvremove -fy "${VG_NAME}"/* || true
+  fi
+  LOG "Removing VG ${VG_NAME} ..."
+  vgremove -fy "${VG_NAME}" || true
+fi
+
+# 4) Wipe PV signatures on the involved disks
+if [[ ${#PVs[@]} -gt 0 ]]; then
+  for pv in "${PVs[@]}"; do
+    LOG "Wiping signatures on ${pv} ..."
+    # Try partition table zap (if gpt tools exist)
+    if command -v sgdisk >/dev/null 2>&1; then
+      sgdisk --zap-all "$pv" || true
+    fi
+    wipefs -a "$pv" || true
+    # Light zero of first 10MiB
+    dd if=/dev/zero of="$pv" bs=1M count=10 status=none || true
+    partprobe "$pv" || true
+  done
+else
+  LOG "No PV devices to wipe."
+fi
+
+# 5) Optional: raw mkfs.ext4 on the cleaned PVs (no partitions)
+if $DO_MKFS && [[ ${#PVs[@]} -gt 0 ]]; then
+  LOG "mkfs.ext4 on PV devices as requested (--mkfs) ..."
+  for pv in "${PVs[@]}"; do
+    mkfs.ext4 -F "$pv"
+  done
+fi
+
+LOG "=== CLEANUP COMPLETE ==="
+LOG "Post-check: df -h (filtered)"
+df -h | grep -E "(${VG_NAME}|/var/app|/opt/Cloudera|hadoop-ozone)" || true
