@@ -1,0 +1,81 @@
+#!/bin/bash
+# === SCM Disk Cleanup Script ===
+# Cleanup ONLY for datavg (no rebuild, no mkfs, no mounts)
+# Mirrors your original script style & LV names.
+
+set -euo pipefail
+
+# Devices
+DISKS=(/dev/sdb /dev/sdc /dev/sdd /dev/sde /dev/sdf /dev/sdg /dev/sdh /dev/sdi /dev/sdj /dev/sdk /dev/sdl)
+
+VG="datavg"
+LVS=(lv_log lv_lib lv_opt1 lv_opt2 lv_ozone_metadata lv_scm_data lv_scm_ratis)
+
+echo "=== $VG Cleanup Start ==="
+
+# Guardrails
+if [[ $EUID -ne 0 ]]; then
+  echo "Run as root."; exit 1
+fi
+if [[ "${VG}" == "rootvg" ]]; then
+  echo "Refusing to touch rootvg."; exit 2
+fi
+
+# Snapshot df
+echo "=== df -h (before) ==="
+df -h | sed -n '1,200p'
+
+# Unmount anything on this VG
+echo "=== Unmounting $VG filesystems ==="
+# Find mountpoints backed by /dev/mapper/datavg-* and /dev/datavg/*
+awk '$1 ~ /(\/dev\/mapper\/datavg-|\/dev\/datavg\/)/ {print $2}' /proc/mounts | \
+  sort -u | tac | while read -r mp; do
+    [[ -z "$mp" ]] && continue
+    echo "umount $mp"
+    fuser -km "$mp" >/dev/null 2>&1 || true
+    umount -fl "$mp" || true
+done
+
+# Remove /etc/fstab entries for this VG (with backup)
+echo "=== Updating /etc/fstab ==="
+ts="$(date +%Y%m%d%H%M%S)"
+cp -a /etc/fstab "/etc/fstab.${ts}.bak"
+sed -i -e '/\/dev\/mapper\/datavg-/d' -e '/\/dev\/datavg\//d' /etc/fstab
+echo "Backup: /etc/fstab.${ts}.bak"
+
+# Remove LVs (ignore errors if missing)
+echo "=== Removing LVs from $VG ==="
+for lv in "${LVS[@]}"; do
+  if [[ -e "/dev/${VG}/${lv}" || -e "/dev/mapper/${VG}-${lv}" ]]; then
+    echo "lvremove -fy /dev/${VG}/${lv}"
+    lvremove -fy "/dev/${VG}/${lv}" >/dev/null 2>&1 || true
+  fi
+done
+# Catch-all: remove any remaining LVs in the VG
+lvs --noheadings "$VG" >/dev/null 2>&1 && lvremove -fy "${VG}"/* >/dev/null 2>&1 || true
+
+# Remove VG (ignore if gone)
+echo "=== Removing VG: $VG ==="
+vgremove -fy "$VG" >/dev/null 2>&1 || true
+
+# Wipe PV signatures on listed disks
+echo "=== Wiping PV/GPT signatures on disks ==="
+for disk in "${DISKS[@]}"; do
+  [[ -b "$disk" ]] || { echo "Skip $disk (not a block dev)"; continue; }
+  echo "Processing $disk"
+  # Zap partitions if GPT tools exist
+  if command -v sgdisk >/dev/null 2>&1; then
+    sgdisk --zap-all "$disk" >/dev/null 2>&1 || true
+  fi
+  # Remove filesystem/LVM sigs
+  wipefs -a "$disk" >/dev/null 2>&1 || true
+  # Light zero first 10MiB (same spirit as your script)
+  dd if=/dev/zero of="$disk" bs=1M count=10 status=none || true
+  partprobe "$disk" >/dev/null 2>&1 || true
+done
+
+echo "=== df -h (after) ==="
+df -h | sed -n '1,200p'
+
+echo "=== $VG Cleanup Complete (no rebuild, no mkfs) ==="
+echo "If you later want to rebuild, run your separate create/format/mount script."
