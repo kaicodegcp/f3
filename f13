@@ -1,0 +1,178 @@
+---
+- name: join pvs once
+  ansible.builtin.set_fact:
+    pvs_joined: "{{ lvm_pvs | join(' ') }}"
+
+- name: check if vg exists
+  ansible.builtin.command: vgs --noheadings {{ lvm_vg }}
+  register: vgchk
+  failed_when: false
+  changed_when: false
+
+- name: vg exists -> mail and stop
+  when: vgchk.rc == 0
+  block:
+    - name: df snapshot
+      ansible.builtin.command: df -h
+      register: df_exist
+      changed_when: false
+    - name: mail vg exists (module)
+      when: use_mail_module
+      ansible.builtin.mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        from: "{{ smtp_from }}"
+        to: "{{ email_to }}"
+        subject: "{{ email_subject }} FAILURE"
+        body: "Host={{ inventory_hostname }} VG={{ lvm_vg }} exists"
+    - name: mail vg exists (cli)
+      when: not use_mail_module
+      ansible.builtin.shell: >
+        echo 'Host={{ inventory_hostname }} VG={{ lvm_vg }} exists'
+        | mail -r '{{ smtp_from }}' -s '{{ email_subject }} FAILURE' '{{ email_to }}'
+      changed_when: false
+    - ansible.builtin.meta: end_play
+
+- name: pv sizes (bytes)
+  ansible.builtin.command: lsblk -b -dn -o SIZE {{ pvs_joined }}
+  register: pv_sizes
+  changed_when: false
+
+- name: compute pv_total_g
+  ansible.builtin.set_fact:
+    pv_total_g: "{{ (pv_sizes.stdout_lines | map('int') | list | sum // (1024*1024*1024)) | int }}"
+
+- name: build integer list of LV sizes
+  ansible.builtin.set_fact:
+    size_list: "{{ (size_list | default([])) + [ (item.size_g | int) ] }}"
+  loop: "{{ lvm_layout }}"
+
+- name: sum lv_total_g from size_list
+  ansible.builtin.set_fact:
+    lv_total_g: "{{ (size_list | map('int') | list | sum) | int }}"
+
+- name: compute needed_g
+  ansible.builtin.set_fact:
+    needed_g: "{{ (((lv_total_g | int) * 105) + 99) // 100 | int }}"
+
+- name: capacity insufficient -> mail and stop
+  when: (pv_total_g | int) < (needed_g | int)
+  block:
+    - name: df snapshot
+      ansible.builtin.command: df -h
+      register: df_cap
+      changed_when: false
+    - name: mail capacity fail (module)
+      when: use_mail_module
+      ansible.builtin.mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        from: "{{ smtp_from }}"
+        to: "{{ email_to }}"
+        subject: "{{ email_subject }} FAILURE"
+        body: "Host={{ inventory_hostname }} Need={{ needed_g }}GiB Have={{ pv_total_g }}GiB"
+    - name: mail capacity fail (cli)
+      when: not use_mail_module
+      ansible.builtin.shell: >
+        echo 'Host={{ inventory_hostname }} Need={{ needed_g }}GiB Have={{ pv_total_g }}GiB'
+        | mail -r '{{ smtp_from }}' -s '{{ email_subject }} FAILURE' '{{ email_to }}'
+      changed_when: false
+    - ansible.builtin.meta: end_play
+
+- name: check existing pv
+  ansible.builtin.command: pvs --noheadings -o pv_name {{ item }}
+  loop: "{{ lvm_pvs }}"
+  register: pvcheck
+  failed_when: false
+  changed_when: false
+
+- name: list pvs to create
+  ansible.builtin.set_fact:
+    pvs_to_create: "{{ lvm_pvs | reject('in', (pvcheck.results | map(attribute='stdout') | list)) | list }}"
+
+- name: pvcreate each new pv
+  ansible.builtin.command: pvcreate -y {{ item }}
+  loop: "{{ pvs_to_create }}"
+  when: pvs_to_create | length > 0
+
+- name: create vg if missing
+  ansible.builtin.command: vgcreate {{ lvm_vg }} {{ pvs_joined }}
+  when: vgchk.rc != 0
+
+- name: current lvs
+  ansible.builtin.command: lvs --noheadings -o lv_name {{ lvm_vg }}
+  register: lv_names
+  failed_when: false
+  changed_when: false
+
+- name: create each lv if missing
+  ansible.builtin.command: lvcreate -y -L {{ item.size_g }}G -n lv_{{ item.name }} {{ lvm_vg }}
+  loop: "{{ lvm_layout }}"
+  when: "( 'lv_' ~ item.name ) not in (lv_names.stdout_lines | map('trim') | list)"
+
+- name: probe fs type
+  ansible.builtin.command: blkid -o value -s TYPE /dev/{{ lvm_vg }}/lv_{{ item.name }}
+  register: blkid_out
+  loop: "{{ lvm_layout }}"
+  failed_when: false
+  changed_when: false
+
+- name: mkfs where needed
+  ansible.builtin.command: mkfs -t {{ lvm_fs }} /dev/{{ lvm_vg }}/lv_{{ item.name }}
+  loop: "{{ lvm_layout }}"
+  when: blkid_out.results[loop.index0].rc != 0 or blkid_out.results[loop.index0].stdout != lvm_fs
+
+- name: make mount dirs
+  ansible.builtin.file:
+    path: "{{ item.mount }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ lvm_layout }}"
+
+- name: ensure fstab line
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    create: yes
+    state: present
+    line: "/dev/{{ lvm_vg }}/lv_{{ item.name }} {{ item.mount }} {{ lvm_fs }} defaults,noatime 0 0"
+  loop: "{{ lvm_layout }}"
+
+- name: mount with module
+  when: use_mount_module
+  ansible.builtin.mount:
+    path: "{{ item.mount }}"
+    src: "/dev/{{ lvm_vg }}/lv_{{ item.name }}"
+    fstype: "{{ lvm_fs }}"
+    opts: "defaults,noatime"
+    state: mounted
+  loop: "{{ lvm_layout }}"
+
+- name: mount with cli
+  when: not use_mount_module
+  ansible.builtin.command: mount {{ item.mount }}
+  register: mnt_try
+  failed_when: false
+  changed_when: mnt_try.rc == 0 and (mnt_try.stderr is not defined or 'already mounted' not in mnt_try.stderr)
+  loop: "{{ lvm_layout }}"
+
+- name: df after
+  ansible.builtin.command: df -h
+  register: df_ok
+  changed_when: false
+
+- name: mail success (module)
+  when: use_mail_module
+  ansible.builtin.mail:
+    host: "{{ smtp_host }}"
+    port: "{{ smtp_port }}"
+    from: "{{ smtp_from }}"
+    to: "{{ email_to }}"
+    subject: "{{ email_subject }} SUCCESS"
+    body: "Host={{ inventory_hostname }} VG={{ lvm_vg }} PV={{ pv_total_g }}GiB LV={{ lv_total_g }}GiB"
+
+- name: mail success (cli)
+  when: not use_mail_module
+  ansible.builtin.shell: >
+    echo 'Host={{ inventory_hostname }} VG={{ lvm_vg }} PV={{ pv_total_g }}GiB LV={{ lv_total_g }}GiB'
+    | mail -r '{{ smtp_from }}' -s '{{ email_subject }} SUCCESS' '{{ email_to }}'
+  changed_when: false
