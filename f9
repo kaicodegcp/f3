@@ -1,0 +1,130 @@
+---
+- name: join pvs once
+  set_fact:
+    pvs_joined: "{{ lvm_pvs | join(' ') }}"
+
+- name: check if vg exists
+  command: vgs --noheadings {{ lvm_vg }}
+  register: vgchk
+  failed_when: false
+  changed_when: false
+
+- name: vg exists -> mail and stop
+  when: vgchk.rc == 0
+  block:
+    - name: df snapshot
+      command: df -h
+      register: df_exist
+      changed_when: false
+    - name: mail vg exists
+      shell: "echo 'Host={{ inventory_hostname }} VG={{ lvm_vg }} exists' | mail -s '{{ email_subject }} FAILURE' '{{ email_to }}'"
+      changed_when: false
+    - meta: end_play
+
+- name: pv sizes (bytes)
+  command: lsblk -b -dn -o SIZE {{ pvs_joined }}
+  register: pv_sizes
+  changed_when: false
+
+- name: compute pv_total_g
+  set_fact:
+    pv_total_g: "{{ (pv_sizes.stdout_lines | map('int') | list | sum // (1024*1024*1024)) | int }}"
+
+- name: init lv_total_g
+  set_fact:
+    lv_total_g: 0
+
+- name: accumulate lv_total_g from template
+  set_fact:
+    lv_total_g: "{{ lv_total_g | int + (item.size_g | int) }}"
+  loop: "{{ lvm_layout }}"
+
+- name: compute needed_g (add 5% headroom, round up)
+  set_fact:
+    needed_g: "{{ ((lv_total_g | int) * 105 + 99) // 100 }}"
+
+- name: capacity insufficient -> mail and stop
+  when: pv_total_g < needed_g
+  block:
+    - name: df snapshot
+      command: df -h
+      register: df_cap
+      changed_when: false
+    - name: mail capacity fail
+      shell: "echo 'Host={{ inventory_hostname }} Need={{ needed_g }}GiB Have={{ pv_total_g }}GiB' | mail -s '{{ email_subject }} FAILURE' '{{ email_to }}'"
+      changed_when: false
+    - meta: end_play
+
+- name: check existing pv
+  command: pvs --noheadings -o pv_name {{ item }}
+  loop: "{{ lvm_pvs }}"
+  register: pvcheck
+  failed_when: false
+  changed_when: false
+
+- name: list pvs to create
+  set_fact:
+    pvs_to_create: "{{ lvm_pvs | reject('in', (pvcheck.results | map(attribute='stdout') | list)) | list }}"
+
+- name: pvcreate each new pv
+  command: pvcreate -y {{ item }}
+  loop: "{{ pvs_to_create }}"
+  when: pvs_to_create | length > 0
+
+- name: create vg if missing
+  command: vgcreate {{ lvm_vg }} {{ pvs_joined }}
+  when: vgchk.rc != 0
+
+- name: current lvs
+  command: lvs --noheadings -o lv_name {{ lvm_vg }}
+  register: lv_names
+  failed_when: false
+  changed_when: false
+
+- name: create each lv if missing
+  command: lvcreate -y -L {{ item.size_g }}G -n lv_{{ item.name }} {{ lvm_vg }}
+  loop: "{{ lvm_layout }}"
+  when: "( 'lv_' ~ item.name ) not in (lv_names.stdout_lines | map('trim') | list)"
+
+- name: probe fs type
+  command: blkid -o value -s TYPE /dev/{{ lvm_vg }}/lv_{{ item.name }}
+  register: blkid_out
+  loop: "{{ lvm_layout }}"
+  failed_when: false
+  changed_when: false
+
+- name: mkfs where needed
+  command: mkfs -t {{ lvm_fs }} /dev/{{ lvm_vg }}/lv_{{ item.name }}
+  loop: "{{ lvm_layout }}"
+  when: blkid_out.results[loop.index0].rc != 0 or blkid_out.results[loop.index0].stdout != lvm_fs
+
+- name: make mount dirs
+  file:
+    path: "{{ item.mount }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ lvm_layout }}"
+
+- name: ensure fstab line
+  lineinfile:
+    path: /etc/fstab
+    create: yes
+    state: present
+    line: "/dev/{{ lvm_vg }}/lv_{{ item.name }} {{ item.mount }} {{ lvm_fs }} defaults,noatime 0 0"
+  loop: "{{ lvm_layout }}"
+
+- name: mount each path
+  command: mount {{ item.mount }}
+  register: mnt_try
+  failed_when: false
+  changed_when: mnt_try.rc == 0 and (mnt_try.stderr is not defined or 'already mounted' not in mnt_try.stderr)
+  loop: "{{ lvm_layout }}"
+
+- name: df after
+  command: df -h
+  register: df_ok
+  changed_when: false
+
+- name: mail success
+  shell: "echo 'Host={{ inventory_hostname }} VG={{ lvm_vg }} PV={{ pv_total_g }}GiB LV={{ lv_total_g }}GiB' | mail -s '{{ email_subject }} SUCCESS' '{{ email_to }}'"
+  changed_when: false
