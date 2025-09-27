@@ -10,3 +10,40 @@ tasks:
       name: cloudera_redhat_python   # your consolidated role
     vars:
       repo_pkg: "{{ 'python36' if ansible_facts['distribution_major_version']=='7' else 'python3' }}"
+
+
+- name: Install RHEL Python3 (auto)
+  hosts: all
+  gather_facts: true
+  become: yes
+
+  pre_tasks:
+    - name: Resolve python_version from OS
+      set_fact:
+        python_version: >-
+          {{ 'rhel7-python3.8.18'
+             if ansible_facts['distribution_major_version'] == '7'
+             else 'rhel8-python3.8.13' }}
+
+    - name: Load matching swidtag vars
+      include_vars:
+        file: "vars/eap_swidtag_{{ python_version }}.yml"
+
+  tasks:
+    - name: Prepare repo
+      include_role:
+        name: update_repo_files
+      vars:
+        package:
+          - python3
+
+    - name: Install RHEL7 python versions
+      include_role:
+        name: install_rhel7_python
+      when: python_version == 'rhel7-python3.8.18'
+
+    - name: Install RHEL8 python versions
+      include_role:
+        name: install_rhel8_python
+      when: python_version == 'rhel8-python3.8.13'
+
