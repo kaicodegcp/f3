@@ -1,117 +1,110 @@
 ---
-# datavg_cleanup.yml
-- hosts: all
-  become: true
-  gather_facts: false
-  vars:
-    VG: "datavg"
-    DISKS:
-      - /dev/sdb
-      - /dev/sdc
-      - /dev/sdd
-      - /dev/sde
-      - /dev/sdf
-      - /dev/sdg
-      - /dev/sdh
-      - /dev/sdi
-      - /dev/sdj
-      - /dev/sdk
-      - /dev/sdl
-    LVS:
-      - lv_log
-      - lv_opt1
-      - lv_opt2
-      - lv_ozone_metadata
-      - lv_scm_data
-      - lv_scm_ratis
+# roles/datavg_cleanup/tasks/main.yml
+- name: guard - must be root
+  ansible.builtin.assert:
+    that: ansible_user_id == "root"
+    quiet: true
 
-  tasks:
-    - name: guard - must be root
-      ansible.builtin.assert:
-        that: ansible_user_id == "root"
-        quiet: true
+- name: guard - refuse rootvg
+  ansible.builtin.assert:
+    that: VG != "rootvg"
+    quiet: true
 
-    - name: guard - refuse rootvg
-      ansible.builtin.assert:
-        that: VG != "rootvg"
-        quiet: true
+- name: df before
+  ansible.builtin.command: df -h
+  register: df_before
+  changed_when: false
 
-    - name: df before
-      ansible.builtin.command: df -h
-      register: df_before
-      changed_when: false
+- name: unmount mounts from this VG
+  ansible.builtin.shell: |
+    awk '{if ($1 ~ /\/dev\/mapper\/{{ VG }}-|\/dev\/{{ VG }}\//) print $2}' /proc/mounts \
+    | sort -r \
+    | while read -r m; do
+        [ "$m" = "/tmp" ] && continue
+        umount "$m" >/dev/null 2>&1 || true
+        umount -f "$m" >/dev/null 2>&1 || true
+      done
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
 
-    - name: unmount mounts from this VG
-      ansible.builtin.shell: |
-        awk '{if ($1 ~ /\/dev\/mapper\/{{ VG }}-|\/dev\/{{ VG }}\//) print $2}' /proc/mounts \
-        | sort -r \
-        | while read -r m; do
-            [ "$m" = "/tmp" ] && continue
-            umount "$m" >/dev/null 2>&1 || true
-            umount -f "$m" >/dev/null 2>&1 || true
-          done
-      args:
-        executable: /bin/bash
-      changed_when: false
-      failed_when: false
+- name: backup fstab
+  ansible.builtin.copy:
+    src: /etc/fstab
+    dest: "/etc/fstab.{{ lookup('pipe','date +%Y%m%d%H%M%S') }}.bak"
+    remote_src: true
 
-    - name: backup fstab
-      ansible.builtin.copy:
-        src: /etc/fstab
-        dest: "/etc/fstab.{{ lookup('pipe','date +%Y%m%d%H%M%S') }}.bak"
-        remote_src: true
+- name: remove fstab entries for this VG
+  ansible.builtin.shell: |
+    sed -i -e '/\/dev\/mapper\/{{ VG }}-/d' -e '/\/dev\/{{ VG }}\//d' /etc/fstab
+  args:
+    executable: /bin/bash
 
-    - name: remove fstab entries for this VG
-      ansible.builtin.shell: |
-        sed -i -e '/\/dev\/mapper\/{{ VG }}-/d' -e '/\/dev\/{{ VG }}\//d' /etc/fstab
-      args:
-        executable: /bin/bash
+# --------- dynamic LV discovery & removal ----------
+- name: discover LV paths in VG
+  ansible.builtin.command: lvs --noheadings -o lv_path {{ VG }}
+  register: lv_paths
+  changed_when: false
+  failed_when: false
 
-    - name: remove listed LVs (ignore errors)
-      ansible.builtin.shell: |
-        lvremove -fy "/dev/{{ VG }}/{{ item }}" >/dev/null 2>&1 || true
-      loop: "{{ LVS }}"
-      args:
-        executable: /bin/bash
-      changed_when: true
-      failed_when: false
+- name: normalize LV list
+  ansible.builtin.set_fact:
+    lvs_dynamic: "{{ (lv_paths.stdout_lines | default([])) | map('trim') | select('match','^/dev/') | list }}"
 
-    - name: catch-all remove any remaining LVs in VG
-      ansible.builtin.shell: |
-        lvs --noheadings "{{ VG }}" >/dev/null 2>&1 && lvremove -fy "{{ VG }}"/* >/dev/null 2>&1 || true
-      args:
-        executable: /bin/bash
-      changed_when: true
-      failed_when: false
+- name: remove discovered LVs (ignore errors)
+  ansible.builtin.shell: |
+    lvremove -fy "{{ item }}" >/dev/null 2>&1 || true
+  loop: "{{ lvs_dynamic }}"
+  args:
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false
 
-    - name: remove VG (ignore if gone)
-      ansible.builtin.command: vgremove -fy "{{ VG }}"
-      changed_when: true
-      failed_when: false
+# catch-all, in case new LVs appeared between steps
+- name: remove any remaining LVs in VG (catch-all)
+  ansible.builtin.shell: |
+    lvs --noheadings "{{ VG }}" >/dev/null 2>&1 && lvremove -fy "{{ VG }}"/* >/dev/null 2>&1 || true
+  args:
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false
+# ---------------------------------------------------
 
-    - name: wipe PV/GPT signatures on disks
-      ansible.builtin.shell: |
-        for disk in {{ DISKS | join(' ') }}; do
-          [ -b "$disk" ] || { echo "skip $disk"; continue; }
-          if command -v sgdisk >/dev/null 2>&1; then
-            sgdisk --zap-all "$disk" >/dev/null 2>&1 || true
-          fi
-          wipefs -a "$disk" >/dev/null 2>&1 || true
-          dd if=/dev/zero of="$disk" bs=1M count=10 status=none || true
-          partprobe "$disk" >/dev/null 2>&1 || true
-        done
-      args:
-        executable: /bin/bash
-      changed_when: true
-      failed_when: false
+- name: remove VG (ignore if gone)
+  ansible.builtin.command: vgremove -fy "{{ VG }}"
+  changed_when: true
+  failed_when: false
 
-    - name: df after
-      ansible.builtin.command: df -h
-      register: df_after
-      changed_when: false
+- name: wipe PV/GPT signatures on disks
+  ansible.builtin.shell: |
+    for disk in {{ DISKS | join(' ') }}; do
+      [ -b "$disk" ] || continue
+      if command -v sgdisk >/dev/null 2>&1; then
+        sgdisk --zap-all "$disk" >/dev/null 2>&1 || true
+      fi
+      wipefs -a "$disk" >/dev/null 2>&1 || true
+      dd if=/dev/zero of="$disk" bs=1M count=10 status=none || true
+      partprobe "$disk" >/dev/null 2>&1 || true
+    done
+  args:
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false
 
-    - name: show before/after
-      ansible.builtin.debug:
-        msg:
-          - "df (before): {{ df_before.stdout }}"
-          - "df (after):  {{ df_after.stdout }}"
+- name: df after
+  ansible.builtin.command: df -h
+  register: df_after
+  changed_when: false
+
+- name: show before/after
+  ansible.builtin.debug:
+    msg:
+      - "df (before): {{ df_before.stdout }}"
+      - "df (after):  {{ df_after.stdout }}"
+
+
+
+roles/datavg_cleanup/defaults/main.yml):
+VG: datavg
+DISKS: [/dev/sdb, /dev/sdc, /dev/sdd, /dev/sde, /dev/sdf, /dev/sdg, /dev/sdh, /dev/sdi, /dev/sdj, /dev/sdk, /dev/sdl]
