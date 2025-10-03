@@ -1,0 +1,42 @@
+Title
+
+Automated datavg Rebuild Completed for All 4 Ozone Host Types
+
+Submitted for Week Ending
+
+10/3/2025
+
+Description
+
+Standardizing Ozone Host Disk Layout with Automation:
+The EAP Strategic Solutions team successfully executed and validated automation to rebuild datavg for all four Ozone host types (OM, SCM, Recon, DataNode). The automation created consistent and compliant mount structures, enabling /data/1 through /data/10 as required by Cloudera Ozone services.
+
+This effort completed the Ozone hardware refresh cycle, ensuring all host types were provisioned with standardized filesystem layouts and validated via Starfleet Ansible execution and automated email success notifications.
+
+Key Achievements:
+
+Rebuilt datavg into 10 logical mounts across Ozone host types.
+
+Verified filesystem allocation and mount readiness via automated reporting (df -h output validation).
+
+Enhanced the automation to include email success notifications with volume group and logical volume details.
+
+Completed successful runs on OM, SCM, Recon, and DataNode hosts in the DEV region.
+
+Benefits to the Team:
+
+Provides consistent Ozone disk layout, reducing configuration drift.
+
+Accelerates host onboarding during hardware lifecycle events.
+
+Eliminates manual filesystem provisioning by fully automating the build process.
+
+Improves reliability and compliance with Cloudera Ozone deployment standards.
+
+Next Steps:
+
+Promote automation to UAT and PROD regions following DEV validation.
+
+Integrate with Ozone cluster provisioning workflows for seamless deployment.
+
+Extend automation to support hybrid or custom disk layouts for specialized use cases.
