@@ -1,0 +1,32 @@
+
+cp /etc/pki/ca-trust/source/anchors/Citi_Device_CA1_G2.crt ~/citi-certs/
+cp /etc/pki/ca-trust/source/anchors/Citi_Root_CA_G2.crt ~/citi-certs/
+cd ~/citi-certs
+
+ls -l Citi_*.crt
+# You should see both Citi_Device_CA1_G2.crt and Citi_Root_CA_G2.crt
+
+cat api.mlab-ctigtdcai03d.ecs.dyn.nsroot.net.crt Citi_Device_CA1_G2.crt Citi_Root_CA_G2.crt > chain-api.pem
+cat apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net.crt Citi_Device_CA1_G2.crt Citi_Root_CA_G2.crt > chain-apps.pem
+cat chain-api.pem chain-apps.pem > additional-certs-bundle.pem
+
+openssl verify -CAfile Citi_Root_CA_G2.crt -untrusted Citi_Device_CA1_G2.crt api.mlab-ctigtdcai03d.ecs.dyn.nsroot.net.crt
+openssl s_client -connect api.mlab-ctigtdcai03d.ecs.dyn.nsroot.net:6443 -servername api.mlab-ctigtdcai03d.ecs.dyn.nsroot.net \
+  -CAfile additional-certs-bundle.pem -verify_return_error </dev/null | egrep 'Verify return code|subject=|issuer='
+
+sudo cp Citi_Device_CA1_G2.crt /etc/pki/ca-trust/source/anchors/
+sudo cp Citi_Root_CA_G2.crt /etc/pki/ca-trust/source/anchors/
+sudo update-ca-trust extract
+
+cat Citi_Device_CA1_G2.crt Citi_Root_CA_G2.crt > citi-ca-bundle.pem
+
+base64 -w0 citi-ca-bundle.pem
+
+export KUBECONFIG=~/eap-dev-kube-config.yaml
+oc version
+# or
+kubectl version --short
+
+Kubernetes Configuration → your updated kubeconfig
+
+Additional Certificates → ~/citi-certs/additional-certs-bundle.pem
