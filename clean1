@@ -1,0 +1,118 @@
+#!/bin/bash
+# datavg_cleanup.sh — generic VG cleanup (no rebuild/mkfs/mounts)
+
+set -euo pipefail
+
+VG="${VG:-datavg}"          # override with: VG=myvg ./datavg_cleanup.sh
+
+echo "=== $VG Cleanup Start ==="
+
+# Guardrails
+if [[ $EUID -ne 0 ]]; then echo "Run as root."; exit 1; fi
+if [[ "${VG}" == "rootvg" || "${VG}" == "rhel" ]]; then
+  echo "Refusing to touch root VG (${VG})."; exit 2
+fi
+
+# Check VG exists
+if ! vgs --noheadings "${VG}" >/dev/null 2>&1; then
+  echo "VG ${VG} not found; nothing to do."; exit 0
+fi
+
+# Snapshot df (before)
+echo "=== df -h (before) ==="
+df -h | sed -n '1,200p'
+
+# Collect LV device paths in this VG (handles any LV names)
+mapfile -t LV_PATHS < <(lvs --noheadings -o lv_path "${VG}" 2>/dev/null | awk '{$1=$1}1')
+
+# Collect mountpoints backed by those LV device paths
+MP_LIST=()
+if [[ ${#LV_PATHS[@]} -gt 0 ]]; then
+  # Use /proc/self/mounts for accuracy; reverse sort by path depth for safe unmount
+  while read -r dev mp _; do
+    for lv in "${LV_PATHS[@]}"; do
+      if [[ "$dev" == "$lv" || "$dev" == "/dev/mapper/${VG}-"* ]]; then
+        MP_LIST+=("$mp")
+        break
+      fi
+    done
+  done < /proc/self/mounts
+fi
+
+# Also catch mounts pointing at /dev/${VG}/* or /dev/mapper/${VG}-* even if lvs output differs
+while read -r dev mp _; do
+  if [[ "$dev" =~ ^/dev/${VG}/ || "$dev" =~ ^/dev/mapper/${VG}- ]]; then
+    MP_LIST+=("$mp")
+  fi
+done < /proc/self/mounts
+
+# Deduplicate and sort deepest-first
+if [[ ${#MP_LIST[@]} -gt 0 ]]; then
+  mapfile -t MP_SORTED < <(printf "%s\n" "${MP_LIST[@]}" | awk '!seen[$0]++' | awk '{print length, $0}' | sort -nr | cut -d" " -f2-)
+else
+  MP_SORTED=()
+fi
+
+# Unmount all filesystems for this VG
+echo "=== Unmounting filesystems for VG=${VG} ==="
+for mp in "${MP_SORTED[@]}"; do
+  [[ -z "$mp" ]] && continue
+  echo "umount $mp"
+  # Try lazy + force variants safely
+  (umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || fuser -km "$mp" 2>/dev/null && umount "$mp" 2>/dev/null) || true
+done
+
+# Update /etc/fstab (remove lines that reference this VG or the LV device paths or mountpoints)
+echo "=== Updating /etc/fstab ==="
+ts="$(date +'%Y%m%d%H%M%S')"
+cp -a /etc/fstab "/etc/fstab.${ts}.bak"
+# Build a regex covering /dev/${VG}/*, /dev/mapper/${VG}-*, explicit LV paths, and mountpoints we unmounted
+FSTAB_REGEX="^(/dev/${VG}/|/dev/mapper/${VG}-"
+for lv in "${LV_PATHS[@]:-}"; do
+  # escape slashes for sed
+  lv_esc="$(printf '%s\n' "$lv" | sed 's/[.[\*^$\/]/\\&/g')"
+  FSTAB_REGEX="${FSTAB_REGEX}|${lv_esc}"
+done
+for mp in "${MP_SORTED[@]:-}"; do
+  mp_esc="$(printf '%s\n' "$mp" | sed 's/[.[\*^$\/]/\\&/g')"
+  FSTAB_REGEX="${FSTAB_REGEX}|${mp_esc}[[:space:]]"
+done
+FSTAB_REGEX="${FSTAB_REGEX})"
+# Remove matching lines
+sed -i.bak2 -E "/${FSTAB_REGEX}/d" /etc/fstab || true
+echo "Backup: /etc/fstab.${ts}.bak"
+
+# Deactivate and remove LVs (catch-all)
+echo "=== Removing LVs from ${VG} ==="
+lvchange -an "${VG}" >/dev/null 2>&1 || true
+lvremove -fy "${VG}" >/dev/null 2>&1 || true
+# Extra sweep via individual paths (idempotent)
+for lv in "${LV_PATHS[@]:-}"; do
+  lvremove -fy "$lv" >/dev/null 2>&1 || true
+done
+lvs --noheadings "${VG}" >/dev/null 2>&1 && lvremove -fy "${VG}" >/dev/null 2>&1 || true
+
+# Remove VG
+echo "=== Removing VG: ${VG} ==="
+vgremove -fy "${VG}" >/dev/null 2>&1 || true
+
+# Discover PV devices for this VG and wipe signatures/partitions
+echo "=== Wiping PV/GPT signatures on PVs of ${VG} ==="
+mapfile -t PV_DISKS < <(pvs --noheadings -o pv_name,vg_name 2>/dev/null | awk -v vg="${VG}" '$2==vg {print $1}')
+for disk in "${PV_DISKS[@]:-}"; do
+  [[ -b "$disk" ]] || { echo "Skip $disk (not a block dev)"; continue; }
+  echo "Processing $disk"
+  if command -v sgdisk >/dev/null 2>&1; then
+    sgdisk --zap-all "$disk" >/dev/null 2>&1 || true
+  fi
+  wipefs -a "$disk" >/dev/null 2>&1 || true
+  dd if=/dev/zero of="$disk" bs=1M count=10 status=none || true
+  partprobe "$disk" >/dev/null 2>&1 || true
+done
+
+# Snapshot df (after)
+echo "=== df -h (after) ==="
+df -h | sed -n '1,200p'
+
+echo "=== ${VG} Cleanup Complete (no rebuild/mkfs) ==="
+echo "If you later want to rebuild, run your create/format/mount script."
