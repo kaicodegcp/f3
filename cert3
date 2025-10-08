@@ -1,0 +1,7 @@
+openssl s_client -connect apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net:443 -servername apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net -showcerts </dev/null | head -20
+
+  openssl s_client -connect apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net:443 \
+  -servername apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net -showcerts </dev/null 2>/dev/null \
+  | awk '/BEGIN CERTIFICATE/{p=1} p; /END CERTIFICATE/{print; p=0}' > apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net.crt
+
+  openssl x509 -in apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net.crt -noout -subject -issuer
