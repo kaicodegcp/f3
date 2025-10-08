@@ -1,0 +1,161 @@
+#!/bin/bash
+# generic_data_cleanup.sh — clean ANY /data/* mounts (LVM or raw partitions)
+# - Unmounts deepest-first
+# - Scrubs /etc/fstab lines for those mounts/devices
+# - If LVM, removes LVs/VGs (except rootvg)
+# - Wipes PVs or raw base disks (sgdisk/wipefs/dd/partprobe)
+# SAFETY: never touches rootvg or any disk that backs non-/data mounts
+
+set -euo pipefail
+
+DRY_RUN="${DRY_RUN:-0}"              # set DRY_RUN=1 to print actions only
+REFUSE_VGS_REGEX='^(rootvg|rhel)$'   # add more system VGs if needed
+TARGET_PREFIX="${TARGET_PREFIX:-/data/}"  # what to clean; defaults to /data/
+
+run() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[DRY] $*"
+  else
+    eval "$@"
+  fi
+}
+
+echo "=== Generic data cleanup start (prefix: ${TARGET_PREFIX}) ==="
+if [[ $EUID -ne 0 ]]; then echo "Run as root."; exit 1; fi
+
+echo "=== df -h (before) ==="
+df -h | sed -n '1,200p'
+
+# 1) Collect target mountpoints: anything mounted under TARGET_PREFIX
+mapfile -t MP_ALL < <(awk -v pfx="${TARGET_PREFIX}" '$2 ~ "^"pfx {print $2}' /proc/self/mounts)
+# Dedup + deepest-first (longest path first)
+mapfile -t MP_SORTED < <(printf "%s\n" "${MP_ALL[@]}" | awk '!seen[$0]++' | awk '{print length,$0}' | sort -nr | cut -d" " -f2-)
+
+if [[ ${#MP_SORTED[@]} -eq 0 ]]; then
+  echo "No mounts under ${TARGET_PREFIX}; continuing to LVM/VG scan (if any)."
+fi
+
+# 2) Determine system/base disks we must NEVER wipe (disks backing non-/data mounts)
+declare -A SYS_DISKS=()
+while read -r dev mp _; do
+  [[ "$mp" == / || "$mp" == /boot* || "$mp" == /var* || "$mp" == /home* || "$mp" == /usr* || "$mp" == /opt* ]] || continue
+  # resolve base disk (strip partitions/DM indirection)
+  base=""
+  if [[ -e "$dev" ]]; then
+    # Use lsblk to find the top-most physical parent (NAME w/o children)
+    base="$(lsblk -no PKNAME "$dev" 2>/dev/null | head -n1)"
+    [[ -z "$base" ]] && base="$(basename "$dev")"
+    base="/dev/${base%%[0-9]*}"
+    base="${base//\/\///}"
+    SYS_DISKS["$base"]=1
+  fi
+done < /proc/self/mounts
+
+# Helper: get base disk for any device (/dev/sdb1, /dev/mapper/VG-LV, /dev/VG/LV)
+get_base_disk() {
+  local dev="$1"
+  # prefer the "disk" row from lsblk -ndo TYPE == disk
+  local b
+  b="$(lsblk -ndo NAME,TYPE "$dev" 2>/dev/null | awk '$2=="disk"{print $1; exit}')"
+  if [[ -n "$b" ]]; then
+    echo "/dev/${b}"
+    return
+  fi
+  # else try PKNAME from the leaf
+  b="$(lsblk -no PKNAME "$dev" 2>/dev/null | head -n1)"
+  [[ -n "$b" ]] && { echo "/dev/${b}"; return; }
+  # fallback: strip trailing digits (partition)
+  echo "/dev/$(basename "$dev" | sed 's/[0-9]*$//')"
+}
+
+# 3) Unmount everything under TARGET_PREFIX (deepest-first)
+echo "=== Unmounting filesystems under ${TARGET_PREFIX} ==="
+for mp in "${MP_SORTED[@]}"; do
+  [[ -z "$mp" ]] && continue
+  echo "-> umount $mp"
+  run "umount '$mp' 2>/dev/null || umount -l '$mp' 2>/dev/null || (fuser -km '$mp' 2>/dev/null || true; umount '$mp' 2>/dev/null) || true"
+done
+
+# 4) Build device list for those mountpoints + any /dev/${VG}/*,/dev/mapper VGs they referenced
+declare -A DEV_SEEN=()
+declare -A VGS_SEEN=()
+while read -r dev mp _; do
+  [[ "$mp" =~ ^${TARGET_PREFIX} ]] || continue
+  [[ -e "$dev" ]] || continue
+  DEV_SEEN["$dev"]=1
+  # If LVM, capture its VG for later removal
+  vg="$(lsblk -no VG "$dev" 2>/dev/null | head -n1 || true)"
+  if [[ -n "${vg:-}" ]]; then
+    VGS_SEEN["$vg"]=1
+  fi
+done < /proc/self/mounts
+
+# Also sweep any devices that still look like /dev/mapper/<VG>-<LV> for target VGs
+while read -r path; do
+  [[ -e "$path" ]] || continue
+  DEV_SEEN["$path"]=1
+  vg="$(lsblk -no VG "$path" 2>/dev/null | head -n1 || true)"
+  [[ -n "${vg:-}" ]] && VGS_SEEN["$vg"]=1
+done < <(ls /dev/mapper 2>/dev/null | sed -n 's#^#\/dev\/mapper\/#p')
+
+# 5) /etc/fstab cleanup
+echo "=== Updating /etc/fstab ==="
+ts="$(date +'%Y%m%d%H%M%S')"
+run "cp -a /etc/fstab /etc/fstab.${ts}.bak"
+# Build sed regex: lines starting with our devices OR containing our mountpoints
+FSTAB_RE="("
+for d in "${!DEV_SEEN[@]}"; do
+  d_esc="$(printf '%s' "$d" | sed 's/[.[\*^$\/]/\\&/g')"
+  FSTAB_RE="${FSTAB_RE}^${d_esc}|"
+done
+for mp in "${MP_SORTED[@]}"; do
+  mp_esc="$(printf '%s' "$mp" | sed 's/[.[\*^$\/]/\\&/g')"
+  FSTAB_RE="${FSTAB_RE}${mp_esc}[[:space:]]|"
+done
+FSTAB_RE="${FSTAB_RE%^|})"
+run "sed -i -E '/${FSTAB_RE}/d' /etc/fstab || true"
+echo "Backup saved: /etc/fstab.${ts}.bak"
+
+# 6) LVM teardown for detected VGs (skip system VGs)
+if [[ ${#VGS_SEEN[@]} -gt 0 ]]; then
+  echo "=== Removing LVM volumes (excluding ${REFUSE_VGS_REGEX}) ==="
+  for vg in "${!VGS_SEEN[@]}"; do
+    if [[ "$vg" =~ $REFUSE_VGS_REGEX ]]; then
+      echo "Skip VG=$vg (protected)"
+      continue
+    fi
+    echo "-> VG=$vg: lvchange -an; lvremove; vgremove"
+    run "lvchange -an '$vg' >/dev/null 2>&1 || true"
+    run "lvremove -fy '$vg'   >/dev/null 2>&1 || true"
+    run "vgremove -fy '$vg'   >/dev/null 2>&1 || true"
+  done
+fi
+
+# 7) Build base disk list from DEV_SEEN and wipe (skip system disks)
+declare -A BASE_DISKS=()
+for d in "${!DEV_SEEN[@]}"; do
+  base="$(get_base_disk "$d")"
+  [[ -b "$base" ]] || continue
+  BASE_DISKS["$base"]=1
+done
+
+echo "=== Wiping PV/GPT/filesystem signatures on data disks ==="
+for disk in "${!BASE_DISKS[@]}"; do
+  if [[ -n "${SYS_DISKS[$disk]+x}" ]]; then
+    echo "SKIP $disk (seen as system disk backing non-${TARGET_PREFIX} mounts)"
+    continue
+  fi
+  echo "-> Process $disk"
+  if command -v sgdisk >/dev/null 2>&1; then
+    run "sgdisk --zap-all '$disk' >/dev/null 2>&1 || true"
+  fi
+  run "wipefs -a '$disk' >/dev/null 2>&1 || true"
+  run "dd if=/dev/zero of='$disk' bs=1M count=10 status=none || true"
+  run "partprobe '$disk' >/dev/null 2>&1 || true"
+done
+
+echo "=== df -h (after) ==="
+df -h | sed -n '1,200p'
+
+echo "=== Data cleanup complete (no rebuild/mkfs) ==="
+echo "Tip: set DRY_RUN=1 to preview. Change TARGET_PREFIX=/data/ if your path differs."
