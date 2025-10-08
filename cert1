@@ -1,0 +1,42 @@
+# === VARS: set your hosts ===
+API_HOST="api.mlab-ctigtdcai03d.ecs.dyn.nsroot.net"
+APPS_WILDCARD="apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net"
+
+# === 0) Working dir ===
+mkdir -p ~/citi-certs && cd ~/citi-certs
+
+# Place these files here beforehand (from your screenshots):
+#  - Citi_Device_CA1_G2.crt
+#  - Citi_Root_CA_G2.crt
+#  - ${APPS_WILDCARD}.crt    (the *.apps… server cert)
+
+# === 1) Export API server leaf cert ===
+openssl s_client -connect "${API_HOST}:6443" -servername "${API_HOST}" -showcerts </dev/null 2>/dev/null \
+ | awk '/BEGIN CERTIFICATE/{p=1} p; /END CERTIFICATE/{print; exit}' > ${API_HOST}.crt
+
+# === 2) Build chains (leaf → intermediate → root) ===
+cat ${API_HOST}.crt            Citi_Device_CA1_G2.crt Citi_Root_CA_G2.crt > chain-api.pem
+cat ${APPS_WILDCARD}.crt       Citi_Device_CA1_G2.crt Citi_Root_CA_G2.crt > chain-apps.pem
+
+# Bundle for CM “Additional Certificates” upload (contains both chains)
+cat chain-api.pem chain-apps.pem > additional-certs-bundle.pem
+
+# Optional: normalize line endings if you copied from Windows
+dos2unix *.crt *.pem 2>/dev/null || true
+
+# === 3) Quick verification ===
+openssl verify -CAfile Citi_Root_CA_G2.crt -untrusted Citi_Device_CA1_G2.crt ${API_HOST}.crt
+openssl s_client -connect "${API_HOST}:6443" -servername "${API_HOST}" \
+  -CAfile additional-certs-bundle.pem -verify_return_error </dev/null \
+  | egrep 'Verify return code|subject=|issuer='
+
+# === 4) (Optional but recommended) OS trust install for CM host ===
+sudo cp Citi_Device_CA1_G2.crt /etc/pki/ca-trust/source/anchors/
+sudo cp Citi_Root_CA_G2.crt   /etc/pki/ca-trust/source/anchors/
+sudo update-ca-trust extract
+
+# === 5) Create CA bundle for kubeconfig (intermediate + root only) ===
+cat Citi_Device_CA1_G2.crt Citi_Root_CA_G2.crt > citi-ca-bundle.pem
+# If you want to embed into kubeconfig:
+B64=$(base64 -w0 citi-ca-bundle.pem)
+# (then replace certificate-authority-data in your kubeconfig with $B64)
