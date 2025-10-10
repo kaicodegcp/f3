@@ -1,0 +1,34 @@
+Description
+
+Strengthening Platform Stability with Automated Python Setup:
+The EAP Strategic Solutions team completed an enhancement to the existing Python installation automation by developing a unified Ansible playbook that detects the host OS version (RHEL7 or RHEL8) and performs automated installation and softlink repair for both python and python3.
+
+This update was critical in addressing VTM patch-related breakages on EAP-managed infrastructure where python and python3 softlinks were often misconfigured post-patching. The improved playbook eliminates the need for user-supplied parameters and ensures the correct packages and links are restored based on OS detection logic.
+
+Key Achievements:
+
+Implemented OS detection logic to auto-select compatible Python package sets for RHEL7 and RHEL8.
+
+Fixed broken softlinks (/usr/bin/python, /usr/bin/python3) by dynamically validating and recreating them.
+
+Deployed and validated playbook in PROD region, making it available for immediate operational use.
+
+Supported seamless recovery during post-VTM patch validation for EAP operations.
+
+Benefits to the Team:
+
+Reduces operational downtime and manual intervention caused by Python softlink issues.
+
+Ensures consistent behavior across mixed RHEL environments without requiring user input.
+
+Provides ready-to-run automation for common platform issues during patching cycles.
+
+Aligns with Citi’s automation-first approach for base OS recoverability.
+
+Next Steps:
+
+Add integrated email reporting of fix actions and versions installed.
+
+Expand playbook to optionally install pip and Python virtualenv modules.
+
+Publish the enhanced playbook as part of standard EAP OS recovery toolkit.
