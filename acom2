@@ -1,0 +1,42 @@
+Title
+
+Resolved CDS Environment Creation Blocker by Generating kube_config.yaml for CDE/CDW Enablement
+
+Submitted for Week Ending
+
+10/3/2025
+
+Description
+
+Unblocking Cloudera Data Services (CDS) Deployment Path for CDE/CDW Enablement:
+The EAP Strategic Solutions team collaborated with Cloudera engineering to troubleshoot and resolve a critical environment failure that had blocked CDS installation and service enablement for over a week. The root cause was traced to missing and misconfigured Kubernetes service account credentials and TLS artifacts required for CDE/CDW environment creation.
+
+To resolve the issue, a compliant and cluster-ready kube_config.yaml file was created, containing the necessary service account bindings, tokens, and certificate references. This config file now enables successful creation of CDS environments and smooth progression with CDE/CDW testing and validation.
+
+Key Achievements:
+
+Coordinated with Cloudera support to isolate the environment setup issue impacting CDS deployment.
+
+Generated and validated kube_config.yaml with proper context, service account token, and TLS certs.
+
+Unblocked CDS environment provisioning on OpenShift, including CDE and CDW workloads.
+
+Successfully tested environment creation using the updated kubeconfig setup.
+
+Benefits to the Team:
+
+Unblocks critical CDS service onboarding, including Cloudera Data Engineering (CDE) and Data Warehouse (CDW).
+
+Establishes a reusable kubeconfig template for all future environment setups.
+
+Avoids manual Kubernetes setup steps during CDS install workflows.
+
+Ensures compliance with Citi’s access control and TLS security policies during CDS onboarding.
+
+Next Steps:
+
+Store the validated kube_config.yaml securely for reuse across lower and upper SDLC environments.
+
+Automate the generation process of kubeconfig using service account creation scripts.
+
+Resume end-to-end CDE/CDW deployment and integration testing.
