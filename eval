@@ -1,0 +1,35 @@
+Leadership Principles
+
+Successfully led the EAP application edge node deployment end-to-end, enhancing automation to simplify installation and streamline deployments across all SDLC environments. This initiative reduced dependency on shared edge nodes through CAP-owned cluster transitions.
+
+Led Spark 3 rollouts across all SDLC clusters, ensuring stability, consistency, and operational efficiency.
+
+Directed Livy 3 deployments to improve Spark job orchestration and scalability.
+
+Spearheaded Python & Citiconda rollout initiatives across enterprise environments, ensuring version alignment and system compatibility.
+
+Led Ozone filesystem and hardware expansion projects across all SDLC clusters to enhance data storage capacity and performance.
+
+Drove GCP GAS enablement for Spark 3 and managed Edge node replacements leveraging Google GAP architecture.
+
+Successfully led CDP Kubernetes (K8s) and Cloudera Data Services on OpenShift implementations, contributing to modernization and container-based data platform readiness.
+
+Risk & Control Goals
+
+Validated and rolled out JDK 17 compatibility for Spark and Spark 3 services across all SDLC environments, ensuring adherence to security and compliance standards.
+
+Partnered with CyberArk to integrate MySQL secrets management, strengthening security posture and ensuring proper risk-control alignment with Citi’s framework.
+
+Financial Performance Goals
+
+Delivered 100% execution on application edge node automation and optimization, driving cost reduction and operational efficiency that directly supported financial performance targets.
+
+Enabled improved infrastructure reuse and faster deployments, reducing manual overhead and enhancing resource utilization across environments.
+
+Client & Franchise Outcomes Goals
+
+Successfully tested CDP Kubernetes (K8) on Cloudera CDP 7.3.1 and 7.1.9 using 1.5.5-h2 images, validating service stability and compatibility.
+
+Completed testing and validation of third-party CDP images, ensuring successful deployment and compliance within Citi’s cloud standards.
+
+Supported delivery of modernized Data Services to internal clients, enhancing scalability, resilience, and alignment with franchise technology modernization goals.
